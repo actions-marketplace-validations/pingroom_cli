@@ -23,7 +23,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 // Kept in lockstep with package.json / package-lock.json / action.yml (a test
 // asserts the GitHub Action pins this exact version). `hook --print-config`
 // emits an `npx @pingroom/cli@<VERSION>` command, so it must match too.
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 
 const DEFAULT_API = process.env.PINGROOM_API_URL || 'https://api.pingroom.io';
 
@@ -49,6 +49,8 @@ ping options:
   -t, --title <text>     Ping title (<= 40 chars)
   -a, --action <1-4>     Quick-action slot to attribute the ping to
   -d, --data <json>      Extra JSON data object, e.g. '{"commit":"abc123"}'
+      --url <https-url>  Make the ping a tappable link (absolute http(s) URL)
+      --button-label <t> Link button text (<= 26 chars; requires --url)
       --require-ack      Keep the ping open until an eligible recipient acknowledges it
       --ack-timeout <s>  Ack deadline in seconds (requires --require-ack)
   -w, --webhook <url>    Room webhook URL (or env PINGROOM_WEBHOOK_URL)
@@ -111,6 +113,10 @@ Examples:
   pingroom ping -w "$PINGROOM_WEBHOOK_URL" -m "Deploy succeeded ✅"
   pingroom ping --token "$PINGROOM_TOKEN" --room ab12cd -m "Release shipped"
 
+  # Link ping — a tappable button that opens a URL:
+  pingroom ping -w "$PINGROOM_WEBHOOK_URL" -m "Build 512 ready" \\
+    --url https://ci.example.com/builds/512 --button-label "Open build"
+
   # Gate a deploy on a human tap — the chosen value prints to stdout:
   if [ "$(pingroom ask --token "$T" --room ab12cd --wait \\
         -p 'Deploy 1.4.0 to production?')" = approve ]; then ./deploy.sh; fi
@@ -165,6 +171,8 @@ function parseArgs(argv) {
     '-a': 'action', '--action': 'action',
     '-d': 'data', '--data': 'data',
     '-w': 'webhook', '--webhook': 'webhook',
+    '--url': 'url',
+    '--button-label': 'button_label',
     '--require-ack': 'require_ack',
     '--ack-timeout': 'ack_timeout',
     '--token': 'token',
@@ -373,6 +381,31 @@ async function ping(args) {
   let data;
   if (args.data !== undefined) {
     data = parseDataObject(args.data);
+  }
+
+  // Link ping: --url/--button-label fold into the structured data object
+  // (server contract: data.url = absolute http(s) <= 2048, data.button_label <= 26).
+  if (args.button_label !== undefined && args.url === undefined) {
+    fail('--button-label requires --url', EXIT.USAGE);
+  }
+  if (args.url !== undefined) {
+    let linkUrl;
+    try {
+      linkUrl = new URL(args.url);
+    } catch {
+      fail('--url is not a valid URL', EXIT.USAGE);
+    }
+    if (linkUrl.protocol !== 'https:' && linkUrl.protocol !== 'http:') {
+      fail('--url must be an absolute http(s) URL', EXIT.USAGE);
+    }
+    if (args.url.length > 2048) {
+      fail('--url must be at most 2048 characters', EXIT.USAGE);
+    }
+    if (args.button_label !== undefined && args.button_label.length > 26) {
+      fail('--button-label must be at most 26 characters', EXIT.USAGE);
+    }
+    data = { ...(data || {}), url: args.url };
+    if (args.button_label !== undefined) data.button_label = args.button_label;
   }
 
   const webhook = args.webhook || process.env.PINGROOM_WEBHOOK_URL;

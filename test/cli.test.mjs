@@ -218,6 +218,33 @@ test('exit 2: agent room --ack-timeout must be within 60–86400 seconds', () =>
   assert.match(stderr, /between 60 and 86400/);
 });
 
+test('exit 2: --button-label requires --url', () => {
+  const { status, stderr } = run(['ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi', '--button-label', 'Open']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--button-label requires --url/);
+});
+
+test('exit 2: --url must be a valid absolute URL', () => {
+  const { status, stderr } = run(['ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi', '--url', '/relative/path']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--url is not a valid URL/);
+});
+
+test('exit 2: --url must be http(s)', () => {
+  const { status, stderr } = run(['ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi', '--url', 'ftp://example.com/x']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--url must be an absolute http\(s\) URL/);
+});
+
+test('exit 2: --button-label over 26 chars', () => {
+  const { status, stderr } = run([
+    'ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi',
+    '--url', 'https://example.com', '--button-label', 'x'.repeat(27),
+  ]);
+  assert.equal(status, 2);
+  assert.match(stderr, /--button-label must be at most 26 characters/);
+});
+
 test('exit 2: --token without --room', () => {
   const { status, stderr } = run(['ping', '--token', 'tok_abc', '-m', 'hi']);
   assert.equal(status, 2);
@@ -255,6 +282,33 @@ test('exit 0: successful webhook delivery', async () => {
     assert.equal(received[0].method, 'POST');
     assert.deepEqual(JSON.parse(received[0].body), {
       message: 'hello', requires_ack: true, ack_timeout_seconds: 45,
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('exit 0: link ping folds --url/--button-label into data', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push({ body });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+  });
+  try {
+    const { status } = await runAsync([
+      'ping', '-w', `${baseUrl}/hook`, '-m', 'build ready',
+      '-d', '{"commit":"abc123"}',
+      '--url', 'https://ci.example.com/b/512', '--button-label', 'Open build',
+    ]);
+    assert.equal(status, 0);
+    assert.deepEqual(JSON.parse(received[0].body), {
+      message: 'build ready',
+      data: { commit: 'abc123', url: 'https://ci.example.com/b/512', button_label: 'Open build' },
     });
   } finally {
     server.close();
@@ -902,7 +956,7 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.4\.0 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.4\.1 hook/);
 });
 
 test('hook Stop pings the room with the last assistant message', async () => {

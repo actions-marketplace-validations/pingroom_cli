@@ -27,6 +27,12 @@ inputs:
   data:
     description: 'Extra JSON data object, e.g. {"commit":"abc123"}.'
     required: false
+  url:
+    description: 'Make the ping a tappable link: absolute http(s) URL (<= 2048 chars).'
+    required: false
+  button-label:
+    description: 'Link button text (<= 26 chars; requires `url`).'
+    required: false
   require-ack:
     description: 'Keep the ping open until one eligible recipient acknowledges it.'
     required: false
@@ -98,6 +104,8 @@ runs:
         PR_TITLE: ${{ inputs.title }}
         PR_ACTION: ${{ inputs.action }}
         PR_DATA: ${{ inputs.data }}
+        PR_URL: ${{ inputs.url }}
+        PR_BUTTON_LABEL: ${{ inputs.button-label }}
         PR_ROOM: ${{ inputs.room }}
         PR_REQUIRE_ACK: ${{ inputs.require-ack }}
         PR_ACK_TIMEOUT: ${{ inputs.ack-timeout }}
@@ -148,6 +156,8 @@ runs:
         [ -n "$PR_TITLE" ]  && args+=(-t "$PR_TITLE")
         [ -n "$PR_ACTION" ] && args+=(-a "$PR_ACTION")
         [ -n "$PR_DATA" ]   && args+=(-d "$PR_DATA")
+        [ -n "$PR_URL" ]    && args+=(--url "$PR_URL")
+        [ -n "$PR_BUTTON_LABEL" ] && args+=(--button-label "$PR_BUTTON_LABEL")
         [ -n "$PR_ROOM" ]   && args+=(--room "$PR_ROOM")
         [ "$PR_REQUIRE_ACK" = "true" ] && args+=(--require-ack)
         [ -n "$PR_ACK_TIMEOUT" ] && args+=(--ack-timeout "$PR_ACK_TIMEOUT")

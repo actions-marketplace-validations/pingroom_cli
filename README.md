@@ -28,6 +28,8 @@ pingroom ping [options]
   -t, --title <text>     Ping title (<= 40 chars)
   -a, --action <1-4>     Quick-action slot to attribute the ping to
   -d, --data <json>      Extra JSON data, e.g. '{"commit":"abc123"}'
+      --url <https-url>  Make the ping a tappable link (absolute http(s) URL)
+      --button-label <t> Link button text (<= 26 chars; requires --url)
       --require-ack      Keep the ping open until an eligible recipient acknowledges it
       --ack-timeout <s>  Ack deadline in seconds (requires --require-ack)
   -w, --webhook <url>    Room webhook URL (or env PINGROOM_WEBHOOK_URL)
@@ -47,6 +49,18 @@ pingroom ping -w "$PINGROOM_WEBHOOK_URL" -m "Production health check failed" \
 
 Webhook timeouts accept 1–86400 seconds. Agent-token room pings accept
 60–86400 seconds.
+
+To attach a tappable link button (a "link ping"), add `--url` and optionally
+`--button-label`. They fold into the structured `data` object as
+`{"url": ..., "button_label": ...}` — the same convention accepted raw via
+`--data`:
+
+```bash
+pingroom ping -w "$PINGROOM_WEBHOOK_URL" -m "Build 512 ready" \
+  --url https://ci.example.com/builds/512 --button-label "Open build"
+```
+
+The URL must be absolute http(s) (≤ 2048 chars); the label caps at 26 chars.
 
 Exit codes: `0` success · `1` delivery failed · `2` bad usage. So CI fails loudly if a
 ping doesn't land.

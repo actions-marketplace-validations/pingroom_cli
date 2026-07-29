@@ -13,6 +13,8 @@
 //   handoff  Hand a decision to a specific human (ack or question) and, with
 //            --wait, block until they acknowledge / answer.
 //   handoffs List the agent's open handoffs or bounded recent history.
+//   live     Drive a live progress card (iOS Live Activity / Android live
+//            update) on the room members' lock screen: start / update / end.
 //
 // Exit codes: 0 success/answered/acked · 1 error · 2 bad usage · 3 expired ·
 // 4 cancelled/recipient-not-ready.
@@ -23,7 +25,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 // Kept in lockstep with package.json / package-lock.json / action.yml (a test
 // asserts the GitHub Action pins this exact version). `hook --print-config`
 // emits an `npx @pingroom/cli@<VERSION>` command, so it must match too.
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 
 const DEFAULT_API = process.env.PINGROOM_API_URL || 'https://api.pingroom.io';
 
@@ -41,6 +43,7 @@ Commands:
   handoff  Hand a decision (ack or question) to a specific human; with --wait,
            block until they acknowledge or answer
   handoffs List the agent's open handoffs or bounded recent history
+  live     Drive a live progress card on the lock screen (Live Activity)
   hook     Claude Code hook: ping on Stop/Notification, and route tool
            permission prompts to a PingRoom question you answer from your phone
 
@@ -97,6 +100,26 @@ handoff options (agent token required; consent scope pingroom:handoffs:create):
 handoffs options (agent token required; consent scope pingroom:handoffs:create):
       --state <s>        open | all (default open)
 
+live <start|update|end|get> options (agent token, or a room webhook):
+  -c, --correlation-id <id>  The stream key — reuse it for every ping (required)
+      --template <name>      start only: status | steps | progress | metrics |
+                             countdown | question | matchup (fixed at creation)
+      --steps <a,b,c>        start only: 2-8 comma-separated step labels
+  -m, --message <text>       The card's live message line
+      --progress <0..1>      Progress bar / Dynamic Island gauge
+      --step <n>             Current step index (steps template)
+      --metric <label:value> Repeatable, up to 3 (metrics template)
+      --deadline-at <epoch>  Countdown target (countdown template)
+      --eta-at <epoch>       Live ETA (status/progress templates)
+      --prompt <text>        The ask (question template)
+      --failed               end only: finish as failed instead of done
+  -t, --title <text>         Card title (<= 40 chars)
+  -a, --action <1-4>         Quick-action slot supplying the icon and sound
+      --require-ack          Add an Acknowledge button
+      --ack-timeout <s>      Ack deadline in seconds
+      --room <code>          Room invite code (used with --token)
+  -w, --webhook <url>        Room webhook URL instead of a token
+
 hook options (agent token required; reads a Claude Code hook event on stdin):
       --room <code>      Room invite code (or env PINGROOM_ROOM)
       --ttl <seconds>    Approval-question expiry for PreToolUse (default 900)
@@ -138,6 +161,16 @@ Examples:
   # -> exit 0 (answered, any value incl. 'hold'); 3 expired; 4 recipient-not-ready
 
   pingroom handoffs --token "$T" --state all   # recent history (up to 200/kind)
+
+  # A live deploy card on everyone's lock screen — one stream, three calls:
+  pingroom live start --token "$T" --room ab12cd -c "deploy-$GITHUB_RUN_ID" \\
+    --template steps --steps "Build,Test,Stage,Ship" -t "Deploy 2.1.0"
+  pingroom live update --token "$T" --room ab12cd -c "deploy-$GITHUB_RUN_ID" \\
+    --step 2 -m "Smoke tests green"
+  pingroom live end --token "$T" --room ab12cd -c "deploy-$GITHUB_RUN_ID" \\
+    -m "Live on production"
+  # ...or end it as a failure, which still delivers one completion alert:
+  #   pingroom live end ... --failed -m "Rollback triggered"
 
   # Connect Claude Code to your phone (prints the settings.json to paste):
   pingroom hook --print-config
@@ -458,6 +491,193 @@ async function ping(args) {
   }
 
   if (!args.json) process.stdout.write('ping sent ✅\n');
+  return EXIT.OK;
+}
+
+// --- live status -----------------------------------------------------------
+
+// Parser for `live`: a leading subcommand (start|update|end|get) plus the
+// live-status flags. Unknown flags fail like the other parsers.
+function parseLiveArgs(argv) {
+  const args = { _: [] };
+  const alias = {
+    '-c': 'correlation_id', '--correlation-id': 'correlation_id',
+    '-t': 'title', '--title': 'title',
+    '-m': 'message', '--message': 'message',
+    '--template': 'template',
+    '--progress': 'progress',
+    '--step': 'step',
+    '--steps': 'steps',
+    '--metric': 'metric',
+    '--deadline-at': 'deadline_at',
+    '--eta-at': 'eta_at',
+    '--prompt': 'prompt',
+    '--failed': 'failed',
+    '-a': 'action', '--action': 'action',
+    '-d': 'data', '--data': 'data',
+    '--require-ack': 'require_ack',
+    '--ack-timeout': 'ack_timeout',
+    '-w': 'webhook', '--webhook': 'webhook',
+    '--token': 'token',
+    '--room': 'room',
+    '--api': 'api',
+    '--json': 'json',
+    '-h': 'help', '--help': 'help',
+  };
+  const booleans = new Set(['require_ack', 'json', 'help', 'failed']);
+  const repeatable = new Set(['metric']);
+
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    const key = alias[token];
+    if (key && booleans.has(key)) {
+      args[key] = true;
+    } else if (key) {
+      const value = argv[++i];
+      if (value === undefined) fail(`option ${token} needs a value`, EXIT.USAGE);
+      if (repeatable.has(key)) (args[key] ||= []).push(value);
+      else args[key] = value;
+    } else if (token.startsWith('-')) {
+      fail(`Unknown option: ${token}`, EXIT.USAGE);
+    } else {
+      args._.push(token);
+    }
+  }
+  return args;
+}
+
+// "label:value" -> {label, value}. Only the first colon splits.
+function buildMetrics(list) {
+  if (!list || list.length === 0) return undefined;
+  return list.map((spec) => {
+    const idx = spec.indexOf(':');
+    if (idx <= 0) fail(`--metric must be "label:value" (got "${spec}")`, EXIT.USAGE);
+    return { label: spec.slice(0, idx), value: spec.slice(idx + 1) };
+  });
+}
+
+function numberOption(raw, flag, { min, max, integer = false } = {}) {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) fail(`${flag} must be a number`, EXIT.USAGE);
+  if (integer && !Number.isInteger(value)) fail(`${flag} must be an integer`, EXIT.USAGE);
+  if (min !== undefined && value < min) fail(`${flag} must be at least ${min}`, EXIT.USAGE);
+  if (max !== undefined && value > max) fail(`${flag} must be at most ${max}`, EXIT.USAGE);
+  return value;
+}
+
+/**
+ * Drive a live progress card on the room members' lock screen.
+ *
+ * One correlation id = one stream: `start` opens it (one alert), `update` moves
+ * it silently, `end` closes it with one completion alert. Works with either an
+ * agent token (--token, needs pingroom:live:write) or a room's incoming webhook
+ * (--webhook), which speak the same `live_status` contract.
+ */
+async function live(args) {
+  const sub = args._[0];
+  const known = ['start', 'update', 'end', 'get'];
+  if (!sub || !known.includes(sub)) {
+    fail(`live needs a subcommand: ${known.join(' | ')}`, EXIT.USAGE);
+  }
+
+  const correlationId = args.correlation_id;
+  if (!correlationId) fail('--correlation-id is required', EXIT.USAGE);
+
+  const webhook = args.webhook || process.env.PINGROOM_WEBHOOK_URL;
+  const token = args.token || process.env.PINGROOM_TOKEN;
+  const apiBase = (args.api || DEFAULT_API).replace(/\/$/, '');
+
+  if (sub === 'get') {
+    if (!token) fail('live get requires an agent token (--token or PINGROOM_TOKEN)', EXIT.USAGE);
+    if (!args.room) fail('--room is required', EXIT.USAGE);
+    requireSafeUrl('--api', apiBase);
+    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(args.room)}/live/${encodeURIComponent(correlationId)}`;
+    const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
+    if (args.json) process.stdout.write(`${text || '{}'}\n`);
+    if (!res.ok) {
+      fail(`read failed: ${(json && (json.message || json.code)) || `HTTP ${res.status}`}`);
+    }
+    if (!args.json) process.stdout.write(`${(json && json.state) || 'unknown'}\n`);
+    return EXIT.OK;
+  }
+
+  const liveStatus = {
+    state: sub === 'end' ? (args.failed ? 'failed' : 'done') : 'running',
+  };
+
+  if (args.message !== undefined) liveStatus.message = args.message;
+  if (args.prompt !== undefined) liveStatus.prompt = args.prompt;
+
+  const progress = numberOption(args.progress, '--progress', { min: 0, max: 1 });
+  if (progress !== undefined) liveStatus.progress = progress;
+
+  const step = numberOption(args.step, '--step', { min: 0, max: 8, integer: true });
+  if (step !== undefined) liveStatus.current_step = step;
+
+  const deadlineAt = numberOption(args.deadline_at, '--deadline-at', { min: 0, integer: true });
+  if (deadlineAt !== undefined) liveStatus.deadline_at = deadlineAt;
+
+  const etaAt = numberOption(args.eta_at, '--eta-at', { min: 0, integer: true });
+  if (etaAt !== undefined) liveStatus.eta_at = etaAt;
+
+  const metrics = buildMetrics(args.metric);
+  if (metrics) liveStatus.metrics = metrics;
+
+  // Template and step labels are fixed when the stream is created; sending them
+  // on an update is a no-op server-side, so only `start` accepts them.
+  if (sub === 'start') {
+    if (args.template) liveStatus.template = args.template;
+    if (args.steps) {
+      const labels = args.steps.split(',').map((s) => s.trim()).filter(Boolean);
+      if (labels.length < 2 || labels.length > 8) {
+        fail('--steps needs between 2 and 8 comma-separated labels', EXIT.USAGE);
+      }
+      liveStatus.steps = labels;
+    }
+  } else if (args.template || args.steps) {
+    fail('--template and --steps are fixed at stream creation; pass them to "live start"', EXIT.USAGE);
+  }
+
+  const body = { correlation_id: correlationId, live_status: liveStatus };
+  if (args.title) body.title = args.title;
+  if (args.action !== undefined) body.action = Number(args.action);
+  if (args.data) {
+    try {
+      body.data = JSON.parse(args.data);
+    } catch {
+      fail('--data must be valid JSON', EXIT.USAGE);
+    }
+  }
+  if (args.require_ack) body.requires_ack = true;
+  const ackTimeout = numberOption(args.ack_timeout, '--ack-timeout', { min: 1, max: 86_400, integer: true });
+  if (ackTimeout !== undefined) body.ack_timeout_seconds = ackTimeout;
+
+  let result;
+  if (webhook) {
+    requireSafeUrl('--webhook', webhook);
+    result = await httpJson('POST', webhook, { body });
+  } else if (token) {
+    if (!args.room) fail('--room is required when using --token', EXIT.USAGE);
+    requireSafeUrl('--api', apiBase);
+    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(args.room)}/live`;
+    result = await httpJson('POST', url, { body, headers: { Authorization: `Bearer ${token}` } });
+  } else {
+    fail('provide a webhook (--webhook / PINGROOM_WEBHOOK_URL) or an agent token (--token / PINGROOM_TOKEN)', EXIT.USAGE);
+  }
+
+  const { res, text, json } = result;
+  if (args.json) process.stdout.write(`${text || '{}'}\n`);
+
+  if (!res.ok || (json && json.success === false)) {
+    const detail = (json && (json.message || json.error || json.code)) || `HTTP ${res.status}`;
+    fail(`live ${sub} failed: ${detail}`);
+  }
+
+  if (!args.json) {
+    const state = (json && (json.state || (json.live_status && json.live_status.state))) || sub;
+    process.stdout.write(`live ${sub} → ${state} ✅\n`);
+  }
   return EXIT.OK;
 }
 
@@ -1190,6 +1410,7 @@ const COMMANDS = {
   handoff: (rest) => handoff(parseHandoffArgs(rest)),
   handoffs: (rest) => listHandoffs(parseQArgs(rest)),
   hook: (rest) => hook(parseHookArgs(rest)),
+  live: (rest) => live(parseLiveArgs(rest)),
 };
 
 function waitFrom(handler, rest) {

@@ -43,14 +43,14 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.4\.1/);
+  assert.match(action, /@pingroom\/cli@0\.5\.0/);
 });
 
 test('package version matches the GitHub Action CLI pin', () => {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.4.1');
+  assert.equal(pkg.version, '0.5.0');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   assert.match(action, new RegExp(`@pingroom/cli@${pkg.version.replaceAll('.', '\\.')}`));
@@ -956,7 +956,7 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.4\.1 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.5\.0 hook/);
 });
 
 test('hook Stop pings the room with the last assistant message', async () => {
@@ -1100,6 +1100,154 @@ test('hook notify events never fail the agent when the ping errors', async () =>
     const { status, stderr } = await runHook(['--api', baseUrl], event, { PINGROOM_TOKEN: 'tok', PINGROOM_ROOM: 'ab12cd' });
     assert.equal(status, 0);
     assert.match(stderr, /hook ping failed/);
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// live — live-status streams
+// ---------------------------------------------------------------------------
+
+test('exit 2: live needs a subcommand', () => {
+  const { status, stderr } = run(['live', '-c', 'x']);
+  assert.equal(status, 2);
+  assert.match(stderr, /live needs a subcommand/);
+});
+
+test('exit 2: live requires a correlation id', () => {
+  const { status, stderr } = run(['live', 'start']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--correlation-id is required/);
+});
+
+test('exit 2: live rejects re-templating on update', () => {
+  const { status, stderr } = run(['live', 'update', '-c', 'x', '--template', 'metrics']);
+  assert.equal(status, 2);
+  assert.match(stderr, /fixed at stream creation/);
+});
+
+test('exit 2: live validates --progress bounds', () => {
+  const { status, stderr } = run(['live', 'update', '-c', 'x', '--progress', '5']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--progress must be at most 1/);
+});
+
+test('exit 2: live validates the --steps label count', () => {
+  const { status, stderr } = run(['live', 'start', '-c', 'x', '--steps', 'only-one']);
+  assert.equal(status, 2);
+  assert.match(stderr, /between 2 and 8/);
+});
+
+test('live start posts a steps stream to the agent route', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push({ method: req.method, url: req.url, auth: req.headers.authorization, body });
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ notification_id: 'n1', correlation_id: 'rel-1', state: 'started' }));
+    });
+  });
+  try {
+    const { status, stdout } = await runAsync([
+      'live', 'start', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      '-c', 'rel-1', '--template', 'steps', '--steps', 'Build, Test ,Ship', '-t', 'Deploy',
+    ]);
+    assert.equal(status, 0);
+    assert.match(stdout, /live start → started/);
+    assert.equal(received.length, 1);
+    assert.equal(received[0].url, '/api/agent/rooms/ab12cd/live');
+    assert.equal(received[0].auth, 'Bearer tok');
+    assert.deepEqual(JSON.parse(received[0].body), {
+      correlation_id: 'rel-1',
+      live_status: { state: 'running', template: 'steps', steps: ['Build', 'Test', 'Ship'] },
+      title: 'Deploy',
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('live end sends a terminal ping, and --failed flips the state', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(JSON.parse(body));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ state: 'done' }));
+    });
+  });
+  try {
+    await runAsync(['live', 'end', '--token', 't', '--room', 'r', '--api', baseUrl, '-c', 'c1', '-m', 'Shipped']);
+    await runAsync(['live', 'end', '--token', 't', '--room', 'r', '--api', baseUrl, '-c', 'c1', '--failed']);
+
+    assert.equal(received[0].live_status.state, 'done');
+    assert.equal(received[0].live_status.message, 'Shipped');
+    assert.equal(received[1].live_status.state, 'failed');
+  } finally {
+    server.close();
+  }
+});
+
+test('live works through a room webhook without a token', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push({ url: req.url, body: JSON.parse(body) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, live_status: { state: 'running' } }));
+    });
+  });
+  try {
+    const { status } = await runAsync([
+      'live', 'update', '-w', `${baseUrl}/api/webhooks/ab12cd/secret`,
+      '-c', 'c2', '--progress', '0.7', '--metric', 'RPS:1.2k',
+    ]);
+    assert.equal(status, 0);
+    assert.equal(received[0].url, '/api/webhooks/ab12cd/secret');
+    assert.deepEqual(received[0].body.live_status, {
+      state: 'running', progress: 0.7, metrics: [{ label: 'RPS', value: '1.2k' }],
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('live get reads a stream back and prints its state', async () => {
+  const { server, baseUrl } = await startServer((req, res) => {
+    assert.equal(req.method, 'GET');
+    assert.equal(req.url, '/api/agent/rooms/ab12cd/live/c3');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ state: 'running', progress: 0.5 }));
+  });
+  try {
+    const { status, stdout } = await runAsync([
+      'live', 'get', '--token', 't', '--room', 'ab12cd', '--api', baseUrl, '-c', 'c3',
+    ]);
+    assert.equal(status, 0);
+    assert.equal(stdout.trim(), 'running');
+  } finally {
+    server.close();
+  }
+});
+
+test('live surfaces the free-tier quota rejection', async () => {
+  const { server, baseUrl } = await startServer((req, res) => {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ code: 'free_limit_reached', message: 'Free accounts can start 5 live streams per day.' }));
+  });
+  try {
+    const { status, stderr } = await runAsync([
+      'live', 'start', '--token', 't', '--room', 'r', '--api', baseUrl, '-c', 'c4',
+    ]);
+    assert.equal(status, 1);
+    assert.match(stderr, /live start failed: Free accounts can start 5/);
   } finally {
     server.close();
   }

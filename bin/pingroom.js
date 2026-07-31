@@ -104,6 +104,9 @@ live <start|update|end|get> options (agent token, or a room webhook):
   -c, --correlation-id <id>  The stream key — reuse it for every ping (required)
       --template <name>      start only: status | steps | progress | metrics |
                              countdown | question | matchup (fixed at creation)
+      --category <name>      start only: status | steps | alert. Legacy, but
+                             'alert' has no template equivalent and is the only
+                             way to start time-sensitive without --require-ack
       --steps <a,b,c>        start only: 2-8 comma-separated step labels
   -m, --message <text>       The card's live message line
       --progress <0..1>      Progress bar / Dynamic Island gauge
@@ -511,6 +514,7 @@ function parseLiveArgs(argv) {
     '-t': 'title', '--title': 'title',
     '-m': 'message', '--message': 'message',
     '--template': 'template',
+    '--category': 'category',
     '--progress': 'progress',
     '--step': 'step',
     '--steps': 'steps',
@@ -681,10 +685,18 @@ async function live(args) {
   const accent = normalizeAccent(args.accent_override);
   if (accent) liveStatus.accent_override = accent;
 
-  // Template and step labels are fixed when the stream is created; sending them
-  // on an update is a no-op server-side, so only `start` accepts them.
+  // Template, category and step labels are fixed when the stream is created;
+  // sending them on an update is a no-op server-side, so only `start` takes them.
   if (sub === 'start') {
     if (args.template) liveStatus.template = args.template;
+    // `alert` has no template equivalent and is the only way to start a stream
+    // time-sensitive (breaking through Focus) without also demanding an ack.
+    if (args.category) {
+      if (!['status', 'steps', 'alert'].includes(args.category)) {
+        fail('--category must be status, steps or alert', EXIT.USAGE);
+      }
+      liveStatus.category = args.category;
+    }
     if (args.steps) {
       const labels = args.steps.split(',').map((s) => s.trim()).filter(Boolean);
       if (labels.length < 2 || labels.length > 8) {
@@ -692,8 +704,8 @@ async function live(args) {
       }
       liveStatus.steps = labels;
     }
-  } else if (args.template || args.steps) {
-    fail('--template and --steps are fixed at stream creation; pass them to "live start"', EXIT.USAGE);
+  } else if (args.template || args.steps || args.category) {
+    fail('--template, --category and --steps are fixed at stream creation; pass them to "live start"', EXIT.USAGE);
   }
 
   const body = { correlation_id: correlationId, live_status: liveStatus };

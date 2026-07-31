@@ -1336,3 +1336,41 @@ test('live surfaces the free-tier quota rejection', async () => {
     server.close();
   }
 });
+
+test('exit 2: live rejects an unknown --category', () => {
+  const { status, stderr } = run(['live', 'start', '-c', 'x', '--category', 'urgent']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--category must be status, steps or alert/);
+});
+
+test('exit 2: live rejects --category on update', () => {
+  const { status, stderr } = run(['live', 'update', '-c', 'x', '--category', 'alert']);
+  assert.equal(status, 2);
+  assert.match(stderr, /fixed at stream creation/);
+});
+
+test('live start sends category=alert for a time-sensitive stream', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(JSON.parse(body));
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ state: 'started' }));
+    });
+  });
+  try {
+    const { status } = await runAsync([
+      'live', 'start', '--token', 't', '--room', 'r', '--api', baseUrl,
+      '-c', 'incident-1', '--category', 'alert', '-m', '5xx climbing',
+    ]);
+    assert.equal(status, 0);
+    // `alert` is the only urgency lever that does not also demand an ack.
+    assert.deepEqual(received[0].live_status, {
+      state: 'running', category: 'alert', message: '5xx climbing',
+    });
+  } finally {
+    server.close();
+  }
+});

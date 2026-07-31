@@ -43,14 +43,14 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.5\.0/);
+  assert.match(action, /@pingroom\/cli@0\.6\.0/);
 });
 
 test('package version matches the GitHub Action CLI pin', () => {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.5.0');
+  assert.equal(pkg.version, '0.6.0');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   assert.match(action, new RegExp(`@pingroom/cli@${pkg.version.replaceAll('.', '\\.')}`));
@@ -956,7 +956,7 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.5\.0 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.6\.0 hook/);
 });
 
 test('hook Stop pings the room with the last assistant message', async () => {
@@ -1216,6 +1216,90 @@ test('live works through a room webhook without a token', async () => {
     });
   } finally {
     server.close();
+  }
+});
+
+test('live start expresses the question template via --option', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(JSON.parse(body));
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ state: 'started' }));
+    });
+  });
+  try {
+    // A bare token is both value and label; the first colon splits the rest.
+    // `--accent-override` normalizes a bare hex back to `#rrggbb` so a shell
+    // that ate an unquoted `#` still produces a valid payload.
+    const { status } = await runAsync([
+      'live', 'start', '--token', 't', '--room', 'r', '--api', baseUrl,
+      '-c', 'q1', '--template', 'question', '--prompt', 'Deploy where?',
+      '--option', 'prod:Production', '--option', 'staging',
+      '--accent-override', 'E53D30',
+    ]);
+    assert.equal(status, 0);
+    assert.deepEqual(received[0].live_status, {
+      state: 'running',
+      prompt: 'Deploy where?',
+      template: 'question',
+      options: [
+        { value: 'prod', label: 'Production' },
+        { value: 'staging', label: 'staging' },
+      ],
+      accent_override: '#e53d30',
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('live start expresses the matchup template via --left/--right/--center', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(JSON.parse(body));
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ state: 'started' }));
+    });
+  });
+  try {
+    const { status } = await runAsync([
+      'live', 'start', '--token', 't', '--room', 'r', '--api', baseUrl,
+      '-c', 'm1', '--template', 'matchup',
+      '--left', 'ARS:2', '--right', 'CHE:1', '--center', "68'",
+    ]);
+    assert.equal(status, 0);
+    assert.deepEqual(received[0].live_status, {
+      state: 'running',
+      template: 'matchup',
+      left: { label: 'ARS', value: '2' },
+      right: { label: 'CHE', value: '1' },
+      center: "68'",
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('live rejects malformed --option, --left, and --accent-override', async () => {
+  const bad = [
+    [['--option', ':nope'], /--option needs a value/],
+    [['--left', 'ARS'], /--left must be "label:value"/],
+    [['--right', 'CHE'], /--right must be "label:value"/],
+    [['--accent-override', 'nothex'], /6-digit hex color/],
+  ];
+  for (const [extra, pattern] of bad) {
+    const { status, stderr } = await runAsync([
+      'live', 'start', '--token', 't', '--room', 'r', '--api', 'https://example.com',
+      '-c', 'c1', ...extra,
+    ]);
+    assert.equal(status, 2);
+    assert.match(stderr, pattern);
   }
 });
 

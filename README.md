@@ -65,6 +65,95 @@ The URL must be absolute http(s) (≤ 2048 chars); the label caps at 26 chars.
 Exit codes: `0` success · `1` delivery failed · `2` bad usage. So CI fails loudly if a
 ping doesn't land.
 
+## Live Activities (`pingroom live`)
+
+A **live-status stream** is one long-running thing shown as a self-updating card
+on the Lock Screen (iOS Live Activity / Dynamic Island, Android live update, and
+a full inline card in the app). `start` opens it with one alert, `update` moves
+it **silently**, `end` closes it with one completion alert.
+
+```
+pingroom live <start|update|end|get> [options]
+
+  -c, --correlation-id <id>  The stream key — reuse it for every ping (required)
+      --template <name>      start only: status | steps | progress | metrics |
+                             countdown | question | matchup (fixed at creation)
+      --steps <a,b,c>        start only: 2-8 comma-separated step labels
+  -m, --message <text>       The card's live message line
+      --progress <0..1>      Progress bar / Dynamic Island gauge
+      --step <n>             Current step index (steps template)
+      --metric <label:value> Repeatable, up to 3 (metrics template)
+      --deadline-at <epoch>  Countdown target (countdown template)
+      --eta-at <epoch>       Live ETA (status/progress templates)
+      --prompt <text>        The ask (question template)
+      --option <value:label> Repeatable, up to 4 (question template)
+      --left <label:value>   Left side (matchup template)
+      --right <label:value>  Right side (matchup template)
+      --center <text>        Center score/clock, <= 40 (matchup template)
+      --accent-override <#rrggbb>  Semantic accent for this frame
+      --failed               end only: finish as failed instead of done
+  -t, --title <text>         Card title (<= 40 chars)
+  -a, --action <1-4>         Quick-action slot supplying the icon and sound
+      --require-ack          Add an Acknowledge button
+      --ack-timeout <s>      Ack deadline in seconds
+  -w, --webhook <url>        Room webhook URL instead of a token
+      --token <token>        Agent access token (or env PINGROOM_TOKEN)
+      --room <code>          Room invite code (used with --token)
+```
+
+Works with either an agent token (`--token`, needs the `pingroom:live:write`
+scope) or a room's incoming webhook (`--webhook`, Pro) — both speak the same
+`live_status` contract.
+
+```bash
+# Track a deploy end to end.
+pingroom live start  -c deploy-42 --template steps \
+  --steps "Build,Test,Deploy,Verify" -t "Release 1.4.0"
+pingroom live update -c deploy-42 --step 2 -m "Deploying to prod"
+pingroom live end    -c deploy-42 -m "Shipped 1.4.0"     # add --failed to fail it
+```
+
+All 7 templates are expressible:
+
+```bash
+# question — up to 4 options. A bare token is both value and label.
+pingroom live start -c q1 --template question \
+  --prompt "Deploy where?" --option prod:Production --option staging:Staging
+
+# matchup — two sides plus a center score/clock.
+pingroom live start -c game-3 --template matchup \
+  --left ARS:2 --right CHE:1 --center "68'"
+
+# metrics — up to 3 counters.
+pingroom live start -c host-1 --template metrics --metric "CPU:45%" --metric "RPS:1.2k"
+
+# countdown — a large live timer.
+pingroom live start -c win-9 --template countdown --deadline-at 1750003600
+```
+
+`--accent-override` takes `#rrggbb` **or** a bare `rrggbb` (case-insensitive;
+it is normalized to lowercase with the `#` before it is sent). Pass it bare, or
+quote it — an *unquoted* `#` starts a comment in `sh`, `bash` and `zsh`, which
+eats the hex and the rest of the line, and the CLI then exits `2` with
+`option --accent-override needs a value`:
+
+```bash
+pingroom live update -c deploy-42 --accent-override e53d30      # ok
+pingroom live update -c deploy-42 --accent-override '#e53d30'   # ok
+pingroom live update -c deploy-42 --accent-override #e53d30     # shell eats it
+```
+
+**Always `end` a stream.** Terminal `done`/`failed` pings are never rate-limited
+or quota-blocked, precisely so a card can't be metered into hanging open on
+someone's Lock Screen. Abandoned streams are swept after ~15 minutes.
+
+`--template` and `--steps` are fixed when the stream is created; passing them to
+`update`/`end` is a usage error rather than a silent no-op. `pingroom live get`
+(agent token only) reads a stream back — every stored field — so a restarted
+producer reconciles instead of opening a duplicate.
+
+Full protocol: <https://pingroom.io/liveactivities.md>
+
 ## GitHub Actions
 
 ```yaml

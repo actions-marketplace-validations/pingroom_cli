@@ -25,7 +25,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 // Kept in lockstep with package.json / package-lock.json / action.yml (a test
 // asserts the GitHub Action pins this exact version). `hook --print-config`
 // emits an `npx @pingroom/cli@<VERSION>` command, so it must match too.
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 
 const DEFAULT_API = process.env.PINGROOM_API_URL || 'https://api.pingroom.io';
 
@@ -112,6 +112,12 @@ live <start|update|end|get> options (agent token, or a room webhook):
       --deadline-at <epoch>  Countdown target (countdown template)
       --eta-at <epoch>       Live ETA (status/progress templates)
       --prompt <text>        The ask (question template)
+      --option <value:label> Repeatable, up to 4 (question template). A bare
+                             token is both value and label
+      --left <label:value>   Left side (matchup template)
+      --right <label:value>  Right side (matchup template)
+      --center <text>        Center score/clock, <= 40 (matchup template)
+      --accent-override <#rrggbb>  Semantic accent for this frame
       --failed               end only: finish as failed instead of done
   -t, --title <text>         Card title (<= 40 chars)
   -a, --action <1-4>         Quick-action slot supplying the icon and sound
@@ -512,6 +518,11 @@ function parseLiveArgs(argv) {
     '--deadline-at': 'deadline_at',
     '--eta-at': 'eta_at',
     '--prompt': 'prompt',
+    '--option': 'option',
+    '--left': 'left',
+    '--right': 'right',
+    '--center': 'center',
+    '--accent-override': 'accent_override',
     '--failed': 'failed',
     '-a': 'action', '--action': 'action',
     '-d': 'data', '--data': 'data',
@@ -525,7 +536,7 @@ function parseLiveArgs(argv) {
     '-h': 'help', '--help': 'help',
   };
   const booleans = new Set(['require_ack', 'json', 'help', 'failed']);
-  const repeatable = new Set(['metric']);
+  const repeatable = new Set(['metric', 'option']);
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -554,6 +565,37 @@ function buildMetrics(list) {
     if (idx <= 0) fail(`--metric must be "label:value" (got "${spec}")`, EXIT.USAGE);
     return { label: spec.slice(0, idx), value: spec.slice(idx + 1) };
   });
+}
+
+// "value:label" -> {value, label}; a bare token is both. Matches the `ask`
+// command's option syntax minus `style`, which live_status options don't carry.
+function buildLiveOptions(list) {
+  if (!list || list.length === 0) return undefined;
+  return list.map((spec) => {
+    const idx = spec.indexOf(':');
+    if (idx < 0) return { value: spec, label: spec };
+    if (idx === 0) fail(`--option needs a value before the colon (got "${spec}")`, EXIT.USAGE);
+    return { value: spec.slice(0, idx), label: spec.slice(idx + 1) };
+  });
+}
+
+// "label:value" -> {label, value}, for --left / --right on the matchup template.
+function buildSide(spec, flag) {
+  if (spec === undefined) return undefined;
+  const idx = spec.indexOf(':');
+  if (idx <= 0) fail(`${flag} must be "label:value" (got "${spec}")`, EXIT.USAGE);
+  return { label: spec.slice(0, idx), value: spec.slice(idx + 1) };
+}
+
+// The server accepts #rrggbb with or without the leading #; normalize to one
+// form so a shell that ate the # (unquoted) still produces a valid payload.
+function normalizeAccent(raw) {
+  if (raw === undefined) return undefined;
+  const hex = raw.trim().replace(/^#/, '');
+  if (!/^[0-9A-Fa-f]{6}$/.test(hex)) {
+    fail(`--accent-override must be a 6-digit hex color (got "${raw}")`, EXIT.USAGE);
+  }
+  return `#${hex.toLowerCase()}`;
 }
 
 function numberOption(raw, flag, { min, max, integer = false } = {}) {
@@ -623,6 +665,21 @@ async function live(args) {
 
   const metrics = buildMetrics(args.metric);
   if (metrics) liveStatus.metrics = metrics;
+
+  const options = buildLiveOptions(args.option);
+  if (options) {
+    if (options.length > 4) fail('--option accepts at most 4 choices', EXIT.USAGE);
+    liveStatus.options = options;
+  }
+
+  const left = buildSide(args.left, '--left');
+  if (left) liveStatus.left = left;
+  const right = buildSide(args.right, '--right');
+  if (right) liveStatus.right = right;
+  if (args.center !== undefined) liveStatus.center = args.center;
+
+  const accent = normalizeAccent(args.accent_override);
+  if (accent) liveStatus.accent_override = accent;
 
   // Template and step labels are fixed when the stream is created; sending them
   // on an update is a no-op server-side, so only `start` accepts them.

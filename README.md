@@ -138,9 +138,9 @@ eats the hex and the rest of the line, and the CLI then exits `2` with
 `option --accent-override needs a value`:
 
 ```bash
-pingroom live update -c deploy-42 --accent-override e53d30      # ok
-pingroom live update -c deploy-42 --accent-override '#e53d30'   # ok
-pingroom live update -c deploy-42 --accent-override #e53d30     # shell eats it
+pingroom live update -c deploy-42 --accent-override e33122      # ok
+pingroom live update -c deploy-42 --accent-override '#e33122'   # ok
+pingroom live update -c deploy-42 --accent-override #e33122     # shell eats it
 ```
 
 **Always `end` a stream.** Terminal `done`/`failed` pings are never rate-limited

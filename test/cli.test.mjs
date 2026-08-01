@@ -1238,7 +1238,7 @@ test('live start expresses the question template via --option', async () => {
       'live', 'start', '--token', 't', '--room', 'r', '--api', baseUrl,
       '-c', 'q1', '--template', 'question', '--prompt', 'Deploy where?',
       '--option', 'prod:Production', '--option', 'staging',
-      '--accent-override', 'E53D30',
+      '--accent-override', 'E33122',
     ]);
     assert.equal(status, 0);
     assert.deepEqual(received[0].live_status, {
@@ -1249,7 +1249,7 @@ test('live start expresses the question template via --option', async () => {
         { value: 'prod', label: 'Production' },
         { value: 'staging', label: 'staging' },
       ],
-      accent_override: '#e53d30',
+      accent_override: '#e33122',
     });
   } finally {
     server.close();

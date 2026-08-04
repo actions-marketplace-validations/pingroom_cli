@@ -711,13 +711,10 @@ async function live(args) {
   const body = { correlation_id: correlationId, live_status: liveStatus };
   if (args.title) body.title = args.title;
   if (args.action !== undefined) body.action = Number(args.action);
-  if (args.data) {
-    try {
-      body.data = JSON.parse(args.data);
-    } catch {
-      fail('--data must be valid JSON', EXIT.USAGE);
-    }
-  }
+  // Same object-shape guard ping/ask/handoff use. A bare JSON.parse also accepts
+  // an array, which the server then rejects — a wasted round trip for what is a
+  // local usage error.
+  if (args.data) body.data = parseDataObject(args.data);
   if (args.require_ack) body.requires_ack = true;
   const ackTimeout = numberOption(args.ack_timeout, '--ack-timeout', { min: 1, max: 86_400, integer: true });
   if (ackTimeout !== undefined) body.ack_timeout_seconds = ackTimeout;

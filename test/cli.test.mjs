@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -73,7 +73,8 @@ function baseEnv() {
   delete cleanEnv.PINGROOM_TOKEN;
   delete cleanEnv.PINGROOM_API_URL;
   delete cleanEnv.PINGROOM_ROOM;
-  delete cleanEnv.PINGROOM_FORCE_TTY;
+  delete cleanEnv.PINGROOM_INTERNAL_TEST_TTY;
+  delete cleanEnv.NODE_ENV;
   cleanEnv.PINGROOM_HOME = EMPTY_HOME;
   return cleanEnv;
 }
@@ -94,18 +95,32 @@ function run(args, env = {}) {
  * `stdin` feeds the interactive prompts (the connect picker, email, OTP); it is
  * written as one blob and the pipe is closed, which is enough because every
  * prompt is answered in order.
+ *
+ * `timeoutMs` kills the child and reports `timedOut`. Tests that assert a loop
+ * terminates need it: without a kill, a regression that reintroduces the loop
+ * hangs the whole suite instead of failing one test.
+ *
+ * `execPath` / `execArgs` let a test start node differently (a umask wrapper, a
+ * --import preload) while keeping the same env scrubbing and capture.
  */
-function runAsync(args, env = {}, { stdin } = {}) {
+function runAsync(args, env = {}, { stdin, timeoutMs, execPath, execArgs = [] } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI, ...args], {
+    const child = spawn(execPath ?? process.execPath, [...execArgs, CLI, ...args], {
       env: { ...baseEnv(), ...env },
     });
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
+    const timer = timeoutMs
+      ? setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs)
+      : null;
     child.stdout.on('data', (c) => (stdout += c));
     child.stderr.on('data', (c) => (stderr += c));
-    child.on('error', reject);
-    child.on('close', (status) => resolve({ status, stdout, stderr }));
+    child.on('error', (err) => { if (timer) clearTimeout(timer); reject(err); });
+    child.on('close', (status) => {
+      if (timer) clearTimeout(timer);
+      resolve({ status, stdout, stderr, timedOut });
+    });
     if (stdin !== undefined) child.stdin.write(stdin);
     child.stdin.end();
   });
@@ -1664,7 +1679,7 @@ test('pairing renders a QR, polls to active, and stores a 0600 credential', asyn
   try {
     const { status, stdout } = await runAsync(
       ['--api', baseUrl],
-      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '120' },
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
       { stdin: '\n' }, // accept the default picker choice (QR)
     );
     assert.equal(status, 0);
@@ -1716,7 +1731,7 @@ test('pairing offers a fresh QR when the pre-claim window expires', async () => 
   try {
     const { status, stdout } = await runAsync(
       ['--api', baseUrl],
-      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '120' },
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
       { stdin: '1\ny\n' },
     );
     assert.equal(status, 0);
@@ -1738,7 +1753,7 @@ test('declining a fresh QR exits 3 and writes no credential', async () => {
   try {
     const { status, stdout } = await runAsync(
       ['--api', baseUrl],
-      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '120' },
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
       { stdin: '1\nn\n' },
     );
     assert.equal(status, 3);
@@ -1756,7 +1771,7 @@ test('a narrow terminal degrades to the pair URL alone', async () => {
   try {
     const { status, stdout } = await runAsync(
       ['--api', baseUrl],
-      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '20' },
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '20' },
       { stdin: '1\n' },
     );
     assert.equal(status, 0);
@@ -1787,7 +1802,7 @@ test('the email fallback claims over the unchanged claim/* endpoints', async () 
   try {
     const { status, stdout, stderr } = await runAsync(
       ['--api', baseUrl],
-      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1' },
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test' },
       { stdin: '2\nme@example.com\n111111\n040176\n' }, // one wrong code, then the right one
     );
     assert.equal(status, 0, stderr);
@@ -1847,8 +1862,569 @@ test('help documents the credential store, the precedence, and the absence of a 
   const { stdout } = run(['--help']);
   assert.match(stdout, /~\/\.pingroom\/credentials\.json/);
   assert.match(stdout, /PINGROOM_HOME/);
-  assert.match(stdout, /explicit flag\s+>\s+env var\s+>\s+~\/\.pingroom\/config\.json\s+>\s+built-in default/);
+  // The paired credential is a real layer, not a dead field: resolveApiBase and
+  // resolveRoom both consult it, so the documented chain has to name it.
+  assert.match(stdout, /explicit flag\s+>\s+env var\s+>\s+~\/\.pingroom\/config\.json\s+>\s+the paired\s+credential\s+>\s+built-in default/);
   assert.match(stdout, /There is no "login" command/);
   assert.match(stdout, /^  config   /m);
   assert.match(stdout, /^  logout   /m);
+});
+
+// ---------------------------------------------------------------------------
+// Regressions from the adversarial audit
+//
+// Every test below was written against a deliberately broken build first: each
+// one fails if its fix is reverted. Several replace earlier tests that passed
+// under mutation (a fresh-file-only permission check, a poll loop with no
+// interval floor) and therefore proved nothing.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pairing stub whose /pair/status responses are scripted as raw HTTP results,
+ * so a test can inject a 502, a 429 or a dropped socket. `drop: true` destroys
+ * the connection, which is what the CLI sees as a network error. The last entry
+ * repeats. `pairStart` overrides the pair/start body.
+ */
+function flakyPairingServer(responses, { pairStart = {} } = {}) {
+  const received = [];
+  const statusTimes = [];
+  let poll = 0;
+  let registrations = 0;
+  return startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const path = req.url.split('?')[0];
+      received.push({ method: req.method, path, auth: req.headers['authorization'], body });
+      if (path === '/api/agent/auth') {
+        registrations += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ credential: 'pre_claim_jwt', credential_type: 'pre_claim', expires_in: 900, scopes: [] }));
+        return;
+      }
+      if (path === '/api/agent/auth/pair/start') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          pair_token: 'p'.repeat(64),
+          pair_url: `https://pingroom.io/app/agents/pair?token=${'p'.repeat(64)}`,
+          expires_in: 900,
+          poll_interval_ms: 10,
+          ...pairStart,
+        }));
+        return;
+      }
+      if (path === '/api/agent/auth/pair/status') {
+        statusTimes.push(Date.now());
+        const spec = responses[Math.min(poll++, responses.length - 1)];
+        if (spec.drop) { req.socket.destroy(); return; }
+        res.writeHead(spec.httpStatus ?? 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(spec.body ?? {}));
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+  }).then((s) => ({
+    ...s,
+    received,
+    statusTimes,
+    get registrations() { return registrations; },
+  }));
+}
+
+/** The env every interactive test needs, now that the TTY override is double-locked. */
+function ttyEnv(home, extra = {}) {
+  return { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', ...extra };
+}
+
+test('EOF on stdin ends pairing instead of restarting it forever', async () => {
+  // The bug: ask() resolved '' at EOF, '' is falsy, and the restart guard read
+  // falsy as "yes". Ctrl-D (or any pipe) then looped the for(;;) minting a fresh
+  // anonymous registration every cycle — thousands of them per minute.
+  const home = newHome();
+  const stub = await flakyPairingServer([{ body: { status: 'expired' } }]);
+  try {
+    const { status, stdout, timedOut } = await runAsync(
+      ['--api', stub.baseUrl],
+      ttyEnv(home, { COLUMNS: '120' }),
+      { stdin: '', timeoutMs: 15_000 }, // stdin closed immediately == Ctrl-D
+    );
+    assert.equal(timedOut, false, 'pairing must terminate on EOF, not spin');
+    assert.equal(status, 3);
+    assert.equal(stub.registrations, 1, 'EOF must not mint a second registration');
+    assert.equal(
+      stub.received.filter((r) => r.path === '/api/agent/auth/pair/start').length,
+      1,
+      'EOF must not start a second pairing round',
+    );
+    assert.match(stdout, /That code expired\./);
+    // And it must not have written a half-formed credential on the way out.
+    assert.throws(() => readFileSync(join(home, 'credentials.json'), 'utf8'));
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an explicit "n" still declines, and "y" still restarts, after the EOF fix', async () => {
+  // The EOF fix must not have collapsed the empty-line-means-yes default.
+  const home = newHome();
+  const stub = await flakyPairingServer([{ body: { status: 'expired' } }, { body: ACTIVE_PAIR }]);
+  try {
+    const { status, stdout } = await runAsync(
+      ['--api', stub.baseUrl],
+      ttyEnv(home, { COLUMNS: '120' }),
+      { stdin: '1\n\n', timeoutMs: 15_000 }, // bare Enter at the restart prompt
+    );
+    assert.equal(status, 0, stdout);
+    assert.equal(stub.registrations, 2, 'an empty line is still "yes, show another"');
+    assert.match(stdout, /✓ Connected as @agt_ab12cd34ef/);
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the credential is only ever presented to the host it was paired against', async () => {
+  // saveCredential records api_url but resolveApiBase used to ignore it, so a
+  // token minted by a staging/self-hosted server was sent to api.pingroom.io on
+  // the very next command.
+  const home = newHome();
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_paired', state: 'pending' } }),
+  });
+  try {
+    seedCredential(home, {
+      token: 'paired_tok',
+      handle: 'agt_paired',
+      room: { invite_code: 'ABC123' },
+      api_url: baseUrl,
+    });
+    // No --api, no PINGROOM_API_URL, no config.api_url: only the credential says
+    // where this token belongs.
+    const { status, stdout } = await runAsync(['ask', '-p', 'Go?'], { PINGROOM_HOME: home });
+    assert.equal(status, 0, stdout);
+    assert.equal(stdout.trim(), 'q_paired');
+    assert.equal(received.length, 1, 'the request must have reached the paired host');
+    assert.equal(received[0].auth, 'Bearer paired_tok');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('pairing writes the api_url the credential was minted at', async () => {
+  const home = newHome();
+  const stub = await flakyPairingServer([{ body: ACTIVE_PAIR }]);
+  try {
+    const { status } = await runAsync(
+      ['--api', stub.baseUrl],
+      ttyEnv(home, { COLUMNS: '20' }),
+      { stdin: '1\n', timeoutMs: 15_000 },
+    );
+    assert.equal(status, 0);
+    const cred = JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8'));
+    assert.equal(cred.api_url, stub.baseUrl);
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('config api_url and the env var both outrank the credential api_url', async () => {
+  const home = newHome();
+  const wrong = await questionServer({
+    'POST /api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_wrong', state: 'pending' } }),
+  });
+  const right = await questionServer({
+    'POST /api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_right', state: 'pending' } }),
+  });
+  try {
+    seedCredential(home, { token: 'paired_tok', room: { invite_code: 'ABC123' }, api_url: wrong.baseUrl });
+
+    run(['config', 'set', 'api_url', right.baseUrl], { PINGROOM_HOME: home });
+    const viaConfig = await runAsync(['ask', '-p', 'Go?'], { PINGROOM_HOME: home });
+    assert.equal(viaConfig.stdout.trim(), 'q_right');
+
+    run(['config', 'set', 'api_url', ''], { PINGROOM_HOME: home });
+    const viaEnv = await runAsync(['ask', '-p', 'Go?'], { PINGROOM_HOME: home, PINGROOM_API_URL: right.baseUrl });
+    assert.equal(viaEnv.stdout.trim(), 'q_right');
+
+    assert.equal(wrong.received.length, 0, 'the credential host must lose to config and env');
+  } finally {
+    wrong.server.close();
+    right.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a transient 502, 429 or dropped connection does not abandon the pairing wait', async () => {
+  for (const flake of [{ httpStatus: 502, body: { message: 'bad gateway' } }, { httpStatus: 429, body: {} }, { drop: true }]) {
+    const home = newHome();
+    const stub = await flakyPairingServer([flake, { body: ACTIVE_PAIR }]);
+    try {
+      const { status, stdout } = await runAsync(
+        ['--api', stub.baseUrl],
+        ttyEnv(home, { COLUMNS: '20' }),
+        { stdin: '1\n', timeoutMs: 20_000 },
+      );
+      assert.equal(status, 0, `${JSON.stringify(flake)}: ${stdout}`);
+      assert.match(stdout, /✓ Connected as @agt_ab12cd34ef/);
+      assert.equal(stub.registrations, 1, 'a retry must reuse the same pre-claim, not re-register');
+    } finally {
+      stub.server.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test('401/403/404 during the pairing poll still fail immediately', async () => {
+  for (const httpStatus of [401, 403, 404]) {
+    const home = newHome();
+    const stub = await flakyPairingServer([{ httpStatus, body: { message: 'gone' } }]);
+    try {
+      const { status, stderr } = await runAsync(
+        ['--api', stub.baseUrl],
+        ttyEnv(home, { COLUMNS: '20' }),
+        { stdin: '1\n', timeoutMs: 15_000 },
+      );
+      assert.equal(status, 1, `HTTP ${httpStatus} must not be retried`);
+      assert.match(stderr, /pairing failed/);
+      const polls = stub.received.filter((r) => r.path === '/api/agent/auth/pair/status').length;
+      assert.equal(polls, 1, `HTTP ${httpStatus} must not be polled twice`);
+    } finally {
+      stub.server.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test('a persistent outage stops at the deadline and says so, rather than retrying silently', async () => {
+  const home = newHome();
+  // expires_in 4s is the whole pairing window here, so the retry loop has to be
+  // bounded by it. Without the bound this test hangs and the timeout fires.
+  const stub = await flakyPairingServer([{ httpStatus: 503, body: { message: 'unavailable' } }], {
+    pairStart: { expires_in: 4 },
+  });
+  try {
+    const { status, stdout, timedOut } = await runAsync(
+      ['--api', stub.baseUrl],
+      ttyEnv(home, { COLUMNS: '20' }),
+      { stdin: '1\n', timeoutMs: 25_000 },
+    );
+    assert.equal(timedOut, false, 'a persistent outage must terminate at the deadline');
+    assert.equal(status, 3);
+    // It retried rather than dying on the first 503 …
+    const polls = stub.received.filter((r) => r.path === '/api/agent/auth/pair/status').length;
+    assert.ok(polls >= 3, `expected several retries within the window, saw ${polls}`);
+    // … told the user it was still trying …
+    assert.match(stdout, /still trying/);
+    // … and reported the outage instead of pretending the code expired.
+    assert.match(stdout, /Gave up waiting — the server kept failing \(last: HTTP 503\)/);
+    assert.doesNotMatch(stdout, /That code expired/);
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the pairing poll never runs faster than the documented 1/second throttle', async () => {
+  // AGENT_PAIRING_SPEC.md throttles GET pair/status at `60,1`. The stub asks for
+  // 10ms; the floor must override it, or the pairing window is spent on 429s.
+  const home = newHome();
+  const stub = await flakyPairingServer([
+    { body: { status: 'pending' } },
+    { body: { status: 'pending' } },
+    { body: ACTIVE_PAIR },
+  ]);
+  try {
+    const { status } = await runAsync(
+      ['--api', stub.baseUrl],
+      ttyEnv(home, { COLUMNS: '20' }),
+      { stdin: '1\n', timeoutMs: 20_000 },
+    );
+    assert.equal(status, 0);
+    assert.equal(stub.statusTimes.length, 3);
+    const gaps = stub.statusTimes.slice(1).map((t, i) => t - stub.statusTimes[i]);
+    for (const gap of gaps) {
+      // setTimeout never fires early, so a small tolerance only covers clock
+      // granularity — a 250ms floor lands at ~250 and fails this.
+      assert.ok(gap >= 950, `polls were ${gap}ms apart; the floor is 1000ms`);
+      assert.ok(gap < 6000, `polls were ${gap}ms apart; the floor is not a stall`);
+    }
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a negative expires_in is clamped instead of producing a deadline in the past', async () => {
+  // Math.max(1, …) is what stops `expires_in: -5` becoming a -5000ms lifetime,
+  // which makes `Date.now() < deadline` false before the first poll and reports
+  // "expired" without ever having asked the server anything.
+  const home = newHome();
+  const stub = await flakyPairingServer([{ body: ACTIVE_PAIR }], { pairStart: { expires_in: -5 } });
+  try {
+    const { status, stdout } = await runAsync(
+      ['--api', stub.baseUrl],
+      ttyEnv(home, { COLUMNS: '20' }),
+      { stdin: '1\n', timeoutMs: 15_000 },
+    );
+    assert.equal(status, 0, stdout);
+    assert.ok(
+      stub.received.some((r) => r.path === '/api/agent/auth/pair/status'),
+      'the clamp must leave at least one poll inside the window',
+    );
+    assert.match(stdout, /✓ Connected as/);
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an "active" status with no credential fails loudly and writes nothing', async () => {
+  // Dropping this guard writes `token: undefined` into credentials.json: the
+  // file then exists, the CLI says "Connected", and every later command fails
+  // with an unrelated auth error.
+  for (const body of [{ status: 'active' }, { status: 'active', credential: '' }]) {
+    const home = newHome();
+    const stub = await flakyPairingServer([{ body }]);
+    try {
+      const { status, stderr } = await runAsync(
+        ['--api', stub.baseUrl],
+        ttyEnv(home, { COLUMNS: '20' }),
+        { stdin: '1\n', timeoutMs: 15_000 },
+      );
+      assert.equal(status, 1, JSON.stringify(body));
+      assert.match(stderr, /pairing succeeded but the server returned no credential/);
+      assert.throws(() => readFileSync(join(home, 'credentials.json'), 'utf8'));
+    } finally {
+      stub.server.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test('a hostile pair_url cannot write ANSI escapes to the terminal', async () => {
+  const home = newHome();
+  const stub = await flakyPairingServer([{ body: { status: 'expired' } }], {
+    pairStart: { pair_url: 'https://evil.test/p\u001b[2J\u001b[1;1H  ✓ Connected as @root\u0007' },
+  });
+  try {
+    const { stdout } = await runAsync(
+      ['--api', stub.baseUrl],
+      ttyEnv(home, { COLUMNS: '20' }), // narrow: no QR, just the URL line
+      { stdin: '1\nn\n', timeoutMs: 15_000 },
+    );
+    assert.ok(!stdout.includes('\u001b'), 'no ESC may reach the terminal');
+    assert.ok(!stdout.includes('\u0007'), 'no BEL may reach the terminal');
+    // The printable part still shows, so the user can see where they are going.
+    assert.match(stdout, /Open: https:\/\/evil\.test\/p\[2J\[1;1H/);
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// --- local state permissions ----------------------------------------------
+
+/** Run the CLI under a specific umask, so mode assertions can't be vacuous. */
+function runUmask(umask, args, env = {}) {
+  const r = spawnSync('/bin/sh', ['-c', `umask ${umask}; exec "$0" "$@"`, process.execPath, CLI, ...args], {
+    env: { ...baseEnv(), ...env },
+    encoding: 'utf8',
+  });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+test('a fresh state directory and file are created 0700/0600 even under a permissive umask', () => {
+  // umask 000 is what makes this assertion mean something: without the explicit
+  // mode/chmod the directory would land at 0777 and the file at 0666.
+  const parent = newHome();
+  const home = join(parent, 'state');
+  try {
+    const { status } = runUmask('000', ['config', 'set', 'default_room', 'ab12cd'], { PINGROOM_HOME: home });
+    assert.equal(status, 0);
+    assert.equal(statSync(home).mode & 0o777, 0o700);
+    assert.equal(statSync(join(home, 'config.json')).mode & 0o777, 0o600);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('a pre-existing world-readable state file is tightened to 0600 on the next write', () => {
+  // The original test only ever wrote a brand new file, so it passed with both
+  // chmods deleted: `mode` on writeFileSync is ignored for an existing file.
+  const home = newHome();
+  const path = join(home, 'config.json');
+  try {
+    writeFileSync(path, '{"default_room":"old"}\n');
+    chmodSync(path, 0o666);
+    assert.equal(statSync(path).mode & 0o777, 0o666, 'precondition: the file starts loose');
+
+    const { status } = runUmask('000', ['config', 'set', 'default_room', 'ab12cd'], { PINGROOM_HOME: home });
+    assert.equal(status, 0);
+    assert.equal(statSync(path).mode & 0o777, 0o600, '0666 -> 0600 is the tightening under test');
+    assert.equal(JSON.parse(readFileSync(path, 'utf8')).default_room, 'ab12cd');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a pre-existing state directory keeps the mode its owner chose', () => {
+  // The directory is the user's, not ours: narrowing a deliberate 0755 to 0700
+  // breaks anything else the user pointed at PINGROOM_HOME. Only a directory
+  // this call created gets the 0700 treatment.
+  const home = newHome();
+  try {
+    chmodSync(home, 0o755);
+    const { status } = runUmask('022', ['config', 'set', 'default_room', 'ab12cd'], { PINGROOM_HOME: home });
+    assert.equal(status, 0);
+    assert.equal(statSync(home).mode & 0o777, 0o755, 'a pre-existing directory must be left alone');
+    // The file inside is still ours to protect.
+    assert.equal(statSync(join(home, 'config.json')).mode & 0o777, 0o600);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a config write replaces the file rather than truncating it in place', () => {
+  // Writing in place means a crash or a full disk between truncate and write
+  // leaves an unparseable file, and readConfigFile degrades that to {} — so the
+  // next `config set` silently discards every other setting. rename() means a
+  // reader only ever sees the whole old file or the whole new one.
+  const home = newHome();
+  const path = join(home, 'config.json');
+  try {
+    run(['config', 'set', 'default_room', 'ab12cd'], { PINGROOM_HOME: home });
+    const firstInode = statSync(path).ino;
+
+    run(['config', 'set', 'api_url', 'https://api.example.test'], { PINGROOM_HOME: home });
+    const secondInode = statSync(path).ino;
+
+    // A rename swaps in a different file; an in-place write keeps the inode.
+    assert.notEqual(secondInode, firstInode, 'the write must be a rename, not a truncate');
+
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    assert.deepEqual(stored, { default_room: 'ab12cd', api_url: 'https://api.example.test' });
+
+    const leftovers = readdirSync(home).filter((f) => f.endsWith('.tmp'));
+    assert.deepEqual(leftovers, [], 'the temp file must be renamed away, not left in place');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// --- argument parsing -------------------------------------------------------
+
+test('inherited Object properties in flag position are not treated as options', async () => {
+  // `alias[token]` walked the prototype chain, so `constructor` resolved to a
+  // truthy value, was parsed as an option, and ate the argument after it —
+  // here, the entire `-m hi` pair.
+  const { server, baseUrl, received } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+  }).then((s) => ({ ...s, received: [] }));
+  try {
+    for (const poison of ['constructor', 'toString', '__proto__', 'valueOf', 'hasOwnProperty']) {
+      const { status, stderr } = await runAsync(['ping', '-w', `${baseUrl}/hook`, poison, '-m', 'hi']);
+      assert.equal(status, 0, `${poison} swallowed the message: ${stderr}`);
+    }
+    // And they are still rejected when they arrive as an actual flag.
+    const { status, stderr } = await runAsync(['ping', '-w', `${baseUrl}/hook`, '--constructor', '-m', 'hi']);
+    assert.equal(status, 2);
+    assert.match(stderr, /Unknown option: --constructor/);
+  } finally {
+    server.close();
+  }
+});
+
+test('live rejects an empty --data the same way ping does', () => {
+  // `if (args.data)` dropped `-d ''` on the floor and shipped the ping without
+  // it; ping/ask/handoff all reject it. Silently sending different data than
+  // the caller asked for is the worst of the three options.
+  const live = run(['live', 'start', '-c', 'x', '--token', 't', '--room', 'ab12cd', '-d', '']);
+  assert.equal(live.status, 2);
+  assert.match(live.stderr, /--data must be valid JSON/);
+
+  const png = run(['ping', '-w', 'https://example.test/hook', '-m', 'hi', '-d', '']);
+  assert.equal(png.status, 2);
+  assert.match(png.stderr, /--data must be valid JSON/);
+});
+
+// --- the interactive gate ---------------------------------------------------
+
+test('interactivity needs BOTH streams to be a TTY, not just stdin', async () => {
+  // Dropping the `stdout.isTTY` half passed every existing test, because the
+  // suite only ever runs with both piped. This forces stdin.isTTY on via a
+  // preload while stdout stays a pipe: the CLI must still refuse to prompt,
+  // because a QR rendered into a pipe is unscannable garbage.
+  const preloadDir = mkdtempSync(join(tmpdir(), 'pingroom-preload-'));
+  const stdinOnly = join(preloadDir, 'stdin-tty.mjs');
+  const bothTty = join(preloadDir, 'both-tty.mjs');
+  writeFileSync(stdinOnly, 'process.stdin.isTTY = true;\n');
+  writeFileSync(bothTty, 'process.stdin.isTTY = true;\nprocess.stdout.isTTY = true;\n');
+
+  const home = newHome();
+  const stub = await flakyPairingServer([{ body: { status: 'expired' } }]);
+  try {
+    // stdin is a TTY, stdout is not -> non-interactive.
+    const piped = await runAsync(['--api', stub.baseUrl], { PINGROOM_HOME: home }, {
+      execArgs: ['--import', pathToFileURL(stdinOnly).href],
+      timeoutMs: 15_000,
+    });
+    assert.equal(piped.status, 0);
+    assert.match(piped.stderr, /not connected/);
+    assert.doesNotMatch(piped.stdout, /Choose \[1\]/);
+    assert.equal(stub.registrations, 0, 'a non-interactive run must not start pairing');
+
+    // Both TTYs -> the picker runs, with no PINGROOM_INTERNAL_TEST_TTY at all.
+    const tty = await runAsync(['--api', stub.baseUrl], { PINGROOM_HOME: home, COLUMNS: '20' }, {
+      execArgs: ['--import', pathToFileURL(bothTty).href],
+      stdin: '1\nn\n',
+      timeoutMs: 15_000,
+    });
+    assert.match(tty.stdout, /Choose \[1\]/);
+    assert.equal(stub.registrations, 1);
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(preloadDir, { recursive: true, force: true });
+  }
+});
+
+test('the TTY override is double-locked so it cannot fire in a normal install', async () => {
+  // A single well-known env var in the shipped binary is one stray `export`
+  // away from making a CI job prompt into the void for the full pairing window.
+  const home = newHome();
+  const stub = await flakyPairingServer([{ body: { status: 'expired' } }]);
+  try {
+    // The retired name does nothing at all.
+    const retired = await runAsync(['--api', stub.baseUrl], { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1' }, { timeoutMs: 15_000 });
+    assert.match(retired.stderr, /not connected/);
+
+    // Neither half is sufficient on its own.
+    const onlyFlag = await runAsync(['--api', stub.baseUrl], { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1' }, { timeoutMs: 15_000 });
+    assert.match(onlyFlag.stderr, /not connected/);
+
+    const onlyEnv = await runAsync(['--api', stub.baseUrl], { PINGROOM_HOME: home, NODE_ENV: 'test' }, { timeoutMs: 15_000 });
+    assert.match(onlyEnv.stderr, /not connected/);
+
+    assert.equal(stub.registrations, 0, 'none of these may reach the pairing flow');
+  } finally {
+    stub.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the shipped binary does not advertise the TTY override', () => {
+  const source = readFileSync(CLI, 'utf8');
+  assert.doesNotMatch(source, /PINGROOM_FORCE_TTY/);
+  // It must not be documented as a supported knob either.
+  const { stdout } = run(['--help']);
+  assert.doesNotMatch(stdout, /FORCE_TTY|INTERNAL_TEST_TTY/);
 });

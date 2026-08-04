@@ -28,7 +28,10 @@
 // 4 cancelled/recipient-not-ready.
 
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync, chmodSync, closeSync, fchmodSync, mkdirSync, openSync,
+  readFileSync, renameSync, unlinkSync, writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -172,9 +175,12 @@ Connecting:
   "pingroom logout" forgets it.
 
   Settings precedence, highest first:
-    explicit flag  >  env var  >  ~/.pingroom/config.json  >  built-in default
+    explicit flag  >  env var  >  ~/.pingroom/config.json  >  the paired
+    credential  >  built-in default
   So --room beats PINGROOM_ROOM beats "config set default_room", and --api beats
-  PINGROOM_API_URL beats "config set api_url" beats ${BUILTIN_API}.
+  PINGROOM_API_URL beats "config set api_url" beats the host you paired against,
+  beats ${BUILTIN_API}. The credential layer is why a token minted by a
+  self-hosted server is never presented to ${BUILTIN_API}.
 
   Non-interactive shells (CI, pipes) never prompt and never draw a QR: set
   PINGROOM_TOKEN there instead.
@@ -249,8 +255,9 @@ function fail(message, code = EXIT.ERROR) {
 //
 // PINGROOM_HOME relocates the directory (tests, sandboxes, multi-account
 // shells). Every lookup is layered: explicit flag > env var > config file >
-// built-in default. PINGROOM_TOKEN is the one env var that also outranks the
-// stored credential, which is what keeps CI working untouched.
+// the paired credential > built-in default. PINGROOM_TOKEN is the one env var
+// that also outranks the stored credential, which is what keeps CI working
+// untouched.
 
 function pingroomHome() {
   return process.env.PINGROOM_HOME || join(homedir(), '.pingroom');
@@ -270,17 +277,39 @@ function readJsonFile(path) {
   return value;
 }
 
-// Write JSON with restrictive permissions. `mode` on writeFileSync only applies
-// when the file is created, so chmod unconditionally afterwards — a file that
-// existed with looser bits gets tightened rather than silently left readable.
+// Write JSON with restrictive permissions, atomically.
+//
+// Writing in place truncates first, so a crash or a full disk between truncate
+// and write leaves a half-written file — and readJsonFile() degrades anything
+// unparseable to {}, so the *next* `config set` would silently drop every other
+// setting. Writing a sibling temp file and renaming over the target means a
+// reader only ever sees the old file or the new one, never a torn one.
+//
+// The temp file is opened 'wx' with mode 0600 and fchmod'd before a single byte
+// is written: `mode` on an existing file is ignored and a post-write chmod
+// leaves a window where the credential is world-readable. rename() carries the
+// 0600 over the target, so a pre-existing loose file is tightened too.
+//
+// mkdirSync(recursive) returns the first path it created, or undefined when the
+// directory already existed. chmod'ing only on the former keeps this from
+// narrowing a directory the user deliberately created at 0755.
 function writeJsonFile(path, value) {
   const dir = pingroomHome();
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  let fd;
   try {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    chmodSync(dir, 0o700);
-    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-    chmodSync(path, 0o600);
+    const created = mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (created !== undefined) chmodSync(dir, 0o700);
+
+    fd = openSync(tmp, 'wx', 0o600);
+    fchmodSync(fd, 0o600); // defeat a permissive umask masking the open mode
+    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, path);
   } catch (err) {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* already gone */ } }
+    try { unlinkSync(tmp); } catch { /* never created */ }
     fail(`could not write ${path}: ${err.message}`);
   }
 }
@@ -300,9 +329,22 @@ function resolveToken(args) {
   return args.token || process.env.PINGROOM_TOKEN || readStoredCredential()?.token || undefined;
 }
 
-/** API base: --api > PINGROOM_API_URL > config.api_url > built-in, no trailing slash. */
+/**
+ * API base: --api > PINGROOM_API_URL > config.api_url > the host the credential
+ * was paired against > built-in, no trailing slash.
+ *
+ * The credential layer is not optional. saveCredential() records `api_url`, and
+ * a token minted by a self-hosted / staging server is only valid there; without
+ * this layer the next command would present that bearer to api.pingroom.io —
+ * leaking it to a host it was never issued for. resolveRoom() already consults
+ * the credential last, so the two layerings now agree.
+ */
 function resolveApiBase(args) {
-  const raw = args.api || process.env.PINGROOM_API_URL || readConfigFile().api_url || BUILTIN_API;
+  const raw = args.api
+    || process.env.PINGROOM_API_URL
+    || readConfigFile().api_url
+    || readStoredCredential()?.api_url
+    || BUILTIN_API;
   return String(raw).replace(/\/$/, '');
 }
 
@@ -323,16 +365,29 @@ function resolveRoom(args) {
 /**
  * True when it is safe to prompt / draw a QR. Both streams must be a TTY: a
  * piped stdin cannot answer a prompt and a piped stdout would capture the QR as
- * garbage. PINGROOM_FORCE_TTY is the escape hatch the tests drive the
- * interactive flows through (and a way to script the email fallback).
+ * garbage.
+ *
+ * The override is deliberately double-locked (internal-looking name AND
+ * NODE_ENV=test) and not documented in --help. A single well-known env var
+ * shipping in the published binary is one stray `export` away from making a CI
+ * job prompt into the void and poll for the full 15-minute pairing window
+ * instead of failing in a second.
  */
 function isInteractive() {
-  if (process.env.PINGROOM_FORCE_TTY === '1') return true;
+  if (process.env.PINGROOM_INTERNAL_TEST_TTY === '1' && process.env.NODE_ENV === 'test') return true;
   return Boolean(process.stdin.isTTY && process.stdout.isTTY);
 }
 
 function sleep(ms) {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+// Drop C0/C1 control characters before echoing server-supplied text to the
+// terminal. Without this an attacker-controlled API base can smuggle ANSI
+// escapes into the output and repaint, erase or overwrite the lines around them.
+function stripControlChars(value) {
+  // eslint-disable-next-line no-control-regex
+  return String(value).replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
 }
 
 // --- ping (unchanged wire behaviour) ---------------------------------------
@@ -359,7 +414,11 @@ function parseArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
-    const key = alias[token];
+    // Object.hasOwn, not alias[token]: a bare lookup walks the prototype chain,
+    // so `constructor` / `toString` / `__proto__` in flag position resolve to a
+    // truthy inherited value, get treated as an option, and swallow the next
+    // argument instead of failing as an unknown flag.
+    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
     if (key && booleans.has(key)) {
       args[key] = true;
     } else if (key) {
@@ -407,7 +466,8 @@ function parseQArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
-    const key = alias[token];
+    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
+    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
     if (key && booleans.has(key)) {
       args[key] = true;
     } else if (key) {
@@ -457,7 +517,8 @@ function parseHandoffArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
-    const key = alias[token];
+    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
+    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
     if (key && booleans.has(key)) {
       args[key] = true;
     } else if (key) {
@@ -508,7 +569,11 @@ function parseDataObject(raw) {
   return data;
 }
 
-async function httpJson(method, url, { body, headers = {} } = {}) {
+// `soft: true` returns { error } instead of exiting on a transport failure. Only
+// the pairing poll passes it: there, a single DNS blip or dropped connection
+// would otherwise kill a 15-minute wait the human is still walking towards their
+// phone for. Every other caller keeps the hard exit.
+async function httpJson(method, url, { body, headers = {}, soft = false } = {}) {
   let res;
   try {
     res = await fetch(url, {
@@ -521,10 +586,18 @@ async function httpJson(method, url, { body, headers = {} } = {}) {
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
   } catch (err) {
+    if (soft) return { res: null, text: '', json: null, error: err };
     fail(`network error: ${err.message}`);
   }
 
-  const text = await res.text();
+  let text;
+  try {
+    text = await res.text();
+  } catch (err) {
+    // A connection dropped mid-body throws here, not at fetch().
+    if (soft) return { res: null, text: '', json: null, error: err };
+    fail(`network error: ${err.message}`);
+  }
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON response */ }
 
@@ -677,7 +750,8 @@ function parseLiveArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
-    const key = alias[token];
+    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
+    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
     if (key && booleans.has(key)) {
       args[key] = true;
     } else if (key) {
@@ -848,7 +922,10 @@ async function live(args) {
   // Same object-shape guard ping/ask/handoff use. A bare JSON.parse also accepts
   // an array, which the server then rejects — a wasted round trip for what is a
   // local usage error.
-  if (args.data) body.data = parseDataObject(args.data);
+  // `!== undefined`, not truthiness: `-d ''` is a malformed value, and a
+  // truthiness test drops it on the floor and ships the ping without the data
+  // the caller believed they attached. ping/ask/handoff all reject it loudly.
+  if (args.data !== undefined) body.data = parseDataObject(args.data);
   if (args.require_ack) body.requires_ack = true;
   const ackTimeout = numberOption(args.ack_timeout, '--ack-timeout', { min: 1, max: 86_400, integer: true });
   if (ackTimeout !== undefined) body.ack_timeout_seconds = ackTimeout;
@@ -1321,7 +1398,8 @@ function parseHookArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
-    const key = alias[token];
+    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
+    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
     if (key && booleans.has(key)) {
       args[key] = true;
     } else if (key) {
@@ -1678,8 +1756,13 @@ async function renderQr(url) {
  * awaiting an HTTP round trip between two questions and drops the lines nobody
  * is listening for, which silently loses piped answers. This queues every line
  * instead, so the answers can arrive in one blob or one keystroke at a time.
- * A closed input resolves '' rather than hanging, so the caller falls through to
- * its own "this is required" error instead of blocking forever.
+ *
+ * ask() resolves `null` — never a string — once the input is closed, so it can
+ * never be confused with a real empty line. That distinction is load-bearing:
+ * callers treat an empty line as "take the default", and a caller that reads EOF
+ * as an empty line will take that default again on the next question, and the
+ * next, forever, because nothing will ever arrive to change its mind. Callers
+ * that genuinely want the empty-line behaviour opt in with `?? ''`.
  */
 function createPrompter() {
   const queued = [];
@@ -1704,7 +1787,7 @@ function createPrompter() {
     if (closed) return;
     closed = true;
     if (buffer) { deliver(buffer); buffer = ''; }
-    while (waiting.length) waiting.shift()('');
+    while (waiting.length) waiting.shift()(null);
   };
 
   process.stdin.setEncoding('utf8');
@@ -1716,7 +1799,7 @@ function createPrompter() {
     ask(question) {
       process.stdout.write(question);
       if (queued.length > 0) return Promise.resolve(queued.shift());
-      if (closed) return Promise.resolve('');
+      if (closed) return Promise.resolve(null);
       return new Promise((resolve) => { waiting.push(resolve); });
     },
     close() {
@@ -1780,20 +1863,61 @@ async function connectByPairing(apiBase, ask) {
       fail(`could not start pairing: ${detail}`);
     }
 
-    const pairUrl = start.json.pair_url;
+    // The URL is server-controlled and goes straight to the terminal, so strip
+    // C0/C1 controls: an --api / config api_url pointing at a hostile host could
+    // otherwise emit ANSI escapes that repaint or hide the line the user is
+    // about to trust with their account.
+    const pairUrl = stripControlChars(start.json.pair_url);
     // 900s is the server's pre-claim lifetime; never poll past it, and clamp the
     // server's suggested interval so a bad value can't busy-loop or stall.
+    // The 1000ms floor is not cosmetic: AGENT_PAIRING_SPEC.md throttles
+    // pair/status at `60,1`, so a faster floor spends the pairing window
+    // collecting 429s instead of the approval.
     const lifetimeMs = Math.max(1, Number(start.json.expires_in) || 900) * 1000;
-    const intervalMs = Math.min(Math.max(Number(start.json.poll_interval_ms) || 1500, 250), 10_000);
+    const intervalMs = Math.min(Math.max(Number(start.json.poll_interval_ms) || 1500, 1000), 10_000);
     const deadline = Date.now() + lifetimeMs;
 
     const drew = await renderQr(pairUrl);
     process.stdout.write(`${drew ? '  Or open' : '  Open'}: ${pairUrl}\n`);
     process.stdout.write('  Waiting for approval… ');
 
-    let outcome = 'expired';
+    // A transient failure must not end a wait the human is mid-way through.
+    // Network errors, 5xx and 429 are the load balancer / rate limiter talking,
+    // not the pairing being over; hard-failing on the first one throws away the
+    // whole 15 minutes over a single blip. 401/403/404 still exit immediately —
+    // those say the pre-claim is gone, and retrying can only spin.
+    // The `Date.now() < deadline` bound is what keeps a *persistent* outage from
+    // retrying forever: it ends at the same moment a clean poll would have.
+    let transientRun = 0;
+    let lastTransient = null;
+    let warnedTransient = false;
+
     while (Date.now() < deadline) {
-      const { res, json } = await httpJson('GET', `${apiBase}/api/agent/auth/pair/status`, { headers });
+      const { res, json, error } = await httpJson(
+        'GET', `${apiBase}/api/agent/auth/pair/status`, { headers, soft: true },
+      );
+
+      if (error || res.status >= 500 || res.status === 429) {
+        transientRun += 1;
+        lastTransient = error
+          ? error.message
+          : `HTTP ${res.status}`;
+        // Say something rather than sitting mute: a user watching a QR with no
+        // output cannot tell a slow approval from a broken endpoint.
+        if (transientRun === 3 && !warnedTransient) {
+          warnedTransient = true;
+          process.stdout.write(`\n  (still trying — ${lastTransient}) `);
+        }
+        // Ride out a short blip at the normal cadence, then back off
+        // geometrically so a real outage is not also a thundering herd. Never
+        // sleep past the deadline this loop is bounded by.
+        const backoff = Math.min(intervalMs * 2 ** Math.max(0, transientRun - 3), 30_000);
+        await sleep(Math.max(0, Math.min(backoff, deadline - Date.now())));
+        continue;
+      }
+
+      transientRun = 0;
+
       if (!res.ok) {
         process.stdout.write('\n');
         const detail = (json && (json.message || json.error || json.code)) || `HTTP ${res.status}`;
@@ -1801,11 +1925,14 @@ async function connectByPairing(apiBase, ask) {
       }
       const status = json && json.status;
       if (status === 'active') {
+        // A server that says "active" with no credential has not paired us.
+        // Without this, `token: undefined` is written to credentials.json and
+        // every later command reads a credential file that exists but cannot
+        // authenticate — a far more confusing failure than stopping here.
         if (typeof json.credential !== 'string' || json.credential === '') {
           process.stdout.write('\n');
           fail('pairing succeeded but the server returned no credential');
         }
-        outcome = 'active';
         const cred = {
           token: json.credential,
           handle: json.handle,
@@ -1823,10 +1950,21 @@ async function connectByPairing(apiBase, ask) {
       await sleep(intervalMs);
     }
 
-    process.stdout.write(`\n  That code expired.\n`);
-    if (outcome !== 'expired') return null;
-    const again = (await ask('  Show a fresh QR code? [Y/n]: ')).trim().toLowerCase();
-    if (again && again !== 'y' && again !== 'yes') return null;
+    if (transientRun > 0) {
+      process.stdout.write(`\n  Gave up waiting — the server kept failing (last: ${lastTransient}).\n`);
+    } else {
+      process.stdout.write(`\n  That code expired.\n`);
+    }
+
+    // `null` means the input is closed, and that is the whole point of this
+    // guard. Reading EOF as "" would fall through the y/yes test below (empty
+    // means "take the default: yes"), restart the for(;;), mint another
+    // anonymous registration, and do it again — a Ctrl-D or a piped stdin turns
+    // a single pairing attempt into thousands of registrations against the API.
+    const again = await ask('  Show a fresh QR code? [Y/n]: ');
+    if (again === null) { process.stdout.write('\n'); return null; }
+    const answer = again.trim().toLowerCase();
+    if (answer && answer !== 'y' && answer !== 'yes') return null;
   }
 }
 
@@ -1838,7 +1976,10 @@ async function connectByEmail(apiBase, ask) {
   const preClaim = await registerAnonymous(apiBase);
   const headers = { Authorization: `Bearer ${preClaim}` };
 
-  const email = (await ask('  Your PingRoom email: ')).trim();
+  // `?? ''` preserves the old EOF behaviour deliberately: ask() now returns null
+  // at EOF, and without the coalesce this would throw a TypeError on `.trim()`
+  // instead of reaching the "this is required" error the user should see.
+  const email = (await ask('  Your PingRoom email: ') ?? '').trim();
   if (!email) fail('an email address is required', EXIT.USAGE);
 
   const start = await httpJson('POST', `${apiBase}/api/agent/auth/claim/start`, {
@@ -1856,7 +1997,9 @@ async function connectByEmail(apiBase, ask) {
   // A mistyped code is the common case, so allow a few tries before giving up.
   // The server locks the registration out after its own attempt cap anyway.
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const otp = (await ask('  Code: ')).trim();
+    // Same reason as the email prompt: EOF stays an empty answer, which the
+    // server rejects, rather than a TypeError on null.
+    const otp = (await ask('  Code: ') ?? '').trim();
     const done = await httpJson('POST', `${apiBase}/api/agent/auth/claim/complete`, {
       body: { email, otp },
       headers,
@@ -1908,7 +2051,10 @@ async function connect(args) {
     process.stdout.write('  Not connected. How do you want to connect?\n');
     process.stdout.write('    1) Scan a QR code with the PingRoom app\n');
     process.stdout.write('    2) Email me a code\n');
-    const choice = (await ask('  Choose [1]: ')).trim();
+    // EOF here means "no answer", which is what the default already covers, so
+    // coalesce rather than crash on null — the pairing branch below is the one
+    // that must distinguish EOF, and it does.
+    const choice = (await ask('  Choose [1]: ') ?? '').trim();
     if (choice && choice !== '1' && choice !== '2') {
       process.stderr.write('pingroom: choose 1 or 2\n');
       return EXIT.USAGE;

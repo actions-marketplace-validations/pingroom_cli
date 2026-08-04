@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 // @pingroom/cli — pings and human-in-the-loop questions for CI, scripts, agents.
-// Zero dependencies: uses Node's built-in fetch (Node >= 20).
+// Node's built-in fetch (Node >= 20) plus one optional dependency,
+// `qrcode-terminal`, used only to draw the pairing QR. Its absence degrades to
+// printing the pair URL, so every non-interactive path stays dependency-free.
+//
+// Run bare (`pingroom`) it resolves its own auth: connected -> a status line and
+// this help; not connected -> the pairing picker. There is deliberately no
+// `login` subcommand.
 //
 // Commands:
 //   ping     Send a ping to a room. Webhook mode (a room URL carries its own
@@ -15,19 +21,24 @@
 //   handoffs List the agent's open handoffs or bounded recent history.
 //   live     Drive a live progress card (iOS Live Activity / Android live
 //            update) on the room members' lock screen: start / update / end.
+//   config   Read/write ~/.pingroom/config.json (default_room, api_url).
+//   logout   Forget the credential in ~/.pingroom/credentials.json.
 //
 // Exit codes: 0 success/answered/acked · 1 error · 2 bad usage · 3 expired ·
 // 4 cancelled/recipient-not-ready.
 
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 // Kept in lockstep with package.json / package-lock.json / action.yml (a test
 // asserts the GitHub Action pins this exact version). `hook --print-config`
 // emits an `npx @pingroom/cli@<VERSION>` command, so it must match too.
 const VERSION = '0.6.0';
 
-const DEFAULT_API = process.env.PINGROOM_API_URL || 'https://api.pingroom.io';
+const BUILTIN_API = 'https://api.pingroom.io';
+const DEFAULT_API = process.env.PINGROOM_API_URL || BUILTIN_API;
 
 const HELP = `pingroom — send a ping, or ask a human a question, from CI/scripts/agents
 
@@ -46,6 +57,8 @@ Commands:
   live     Drive a live progress card on the lock screen (Live Activity)
   hook     Claude Code hook: ping on Stop/Notification, and route tool
            permission prompts to a PingRoom question you answer from your phone
+  config   Read/write local settings (config list | get <key> | set <key> <val>)
+  logout   Forget the stored credential
 
 ping options:
   -m, --message <text>   Ping body text (required)
@@ -135,11 +148,36 @@ hook options (agent token required; reads a Claude Code hook event on stdin):
       --quiet            Suppress the informational stderr lines
       --print-config     Print a ready-to-paste ~/.claude/settings.json block
 
+config options:
+  pingroom config list              Print the stored settings
+  pingroom config get <key>         Print one setting
+  pingroom config set <key> <val>   Store a setting (an empty value clears it)
+  Keys: default_room, api_url
+
 Shared:
       --token <token>    Agent access token (or env PINGROOM_TOKEN)
       --api <url>        API base URL (default ${DEFAULT_API}; env PINGROOM_API_URL)
       --json             Print the raw JSON response
   -h, --help             Show this help
+
+Connecting:
+  Run "pingroom" with no arguments to connect. It prints a QR code you scan with
+  the PingRoom app — you pick the account and the delivery room there — or you
+  can choose the emailed-code fallback. There is no "login" command: being
+  unconnected is a state the tool resolves, not one you have to discover.
+
+  The credential is written to ~/.pingroom/credentials.json (mode 0600, in a
+  0700 directory). PINGROOM_HOME overrides that directory. PINGROOM_TOKEN in the
+  environment ALWAYS wins over the stored credential, so CI is unaffected.
+  "pingroom logout" forgets it.
+
+  Settings precedence, highest first:
+    explicit flag  >  env var  >  ~/.pingroom/config.json  >  built-in default
+  So --room beats PINGROOM_ROOM beats "config set default_room", and --api beats
+  PINGROOM_API_URL beats "config set api_url" beats ${BUILTIN_API}.
+
+  Non-interactive shells (CI, pipes) never prompt and never draw a QR: set
+  PINGROOM_TOKEN there instead.
 
 Examples:
   pingroom ping -w "$PINGROOM_WEBHOOK_URL" -m "Deploy succeeded ✅"
@@ -201,6 +239,100 @@ const EXIT = { OK: 0, ERROR: 1, USAGE: 2, EXPIRED: 3, CANCELLED: 4 };
 function fail(message, code = EXIT.ERROR) {
   process.stderr.write(`pingroom: ${message}\n`);
   process.exit(code);
+}
+
+// --- local state (~/.pingroom) ---------------------------------------------
+//
+// Two files, both under a 0700 directory:
+//   credentials.json  the agent credential this machine paired (mode 0600)
+//   config.json       user settings: default_room, api_url
+//
+// PINGROOM_HOME relocates the directory (tests, sandboxes, multi-account
+// shells). Every lookup is layered: explicit flag > env var > config file >
+// built-in default. PINGROOM_TOKEN is the one env var that also outranks the
+// stored credential, which is what keeps CI working untouched.
+
+function pingroomHome() {
+  return process.env.PINGROOM_HOME || join(homedir(), '.pingroom');
+}
+
+function credentialsPath() { return join(pingroomHome(), 'credentials.json'); }
+function configPath() { return join(pingroomHome(), 'config.json'); }
+
+// Read a JSON object, or null for anything unreadable/corrupt. Local state must
+// never be able to crash a ping: a hand-edited file degrades to "not set".
+function readJsonFile(path) {
+  let raw;
+  try { raw = readFileSync(path, 'utf8'); } catch { return null; }
+  let value;
+  try { value = JSON.parse(raw); } catch { return null; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value;
+}
+
+// Write JSON with restrictive permissions. `mode` on writeFileSync only applies
+// when the file is created, so chmod unconditionally afterwards — a file that
+// existed with looser bits gets tightened rather than silently left readable.
+function writeJsonFile(path, value) {
+  const dir = pingroomHome();
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  } catch (err) {
+    fail(`could not write ${path}: ${err.message}`);
+  }
+}
+
+function readStoredCredential() {
+  const cred = readJsonFile(credentialsPath());
+  if (!cred || typeof cred.token !== 'string' || cred.token === '') return null;
+  return cred;
+}
+
+function readConfigFile() {
+  return readJsonFile(configPath()) || {};
+}
+
+/** Agent token: --token > PINGROOM_TOKEN > the paired credential. */
+function resolveToken(args) {
+  return args.token || process.env.PINGROOM_TOKEN || readStoredCredential()?.token || undefined;
+}
+
+/** API base: --api > PINGROOM_API_URL > config.api_url > built-in, no trailing slash. */
+function resolveApiBase(args) {
+  const raw = args.api || process.env.PINGROOM_API_URL || readConfigFile().api_url || BUILTIN_API;
+  return String(raw).replace(/\/$/, '');
+}
+
+/**
+ * Room invite code: --room > PINGROOM_ROOM > config.default_room > the room the
+ * credential was paired to. The paired room is last because it is the weakest
+ * signal — it is where the agent was told to deliver, not necessarily where
+ * this invocation means to.
+ */
+function resolveRoom(args) {
+  return args.room
+    || process.env.PINGROOM_ROOM
+    || readConfigFile().default_room
+    || readStoredCredential()?.room?.invite_code
+    || undefined;
+}
+
+/**
+ * True when it is safe to prompt / draw a QR. Both streams must be a TTY: a
+ * piped stdin cannot answer a prompt and a piped stdout would capture the QR as
+ * garbage. PINGROOM_FORCE_TTY is the escape hatch the tests drive the
+ * interactive flows through (and a way to script the email fallback).
+ */
+function isInteractive() {
+  if (process.env.PINGROOM_FORCE_TTY === '1') return true;
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
 // --- ping (unchanged wire behaviour) ---------------------------------------
@@ -451,8 +583,9 @@ async function ping(args) {
   }
 
   const webhook = args.webhook || process.env.PINGROOM_WEBHOOK_URL;
-  const token = args.token || process.env.PINGROOM_TOKEN;
-  const apiBase = (args.api || DEFAULT_API).replace(/\/$/, '');
+  const token = resolveToken(args);
+  const apiBase = resolveApiBase(args);
+  const room = resolveRoom(args);
 
   let result;
 
@@ -469,12 +602,12 @@ async function ping(args) {
     if (ackTimeout !== undefined) body.ack_timeout_seconds = ackTimeout;
     result = await httpJson('POST', webhook, { body });
   } else if (token) {
-    if (!args.room) fail('--room is required when using --token', EXIT.USAGE);
+    if (!room) fail('--room is required when using --token (or set one with "pingroom config set default_room <code>")', EXIT.USAGE);
     if (ackTimeout !== undefined && (ackTimeout < 60 || ackTimeout > 86_400)) {
       fail('--ack-timeout must be between 60 and 86400 seconds for an agent room ping', EXIT.USAGE);
     }
     requireSafeUrl('--api', apiBase);
-    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(args.room)}/notifications`;
+    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(room)}/notifications`;
     const body = { message };
     if (args.title) body.title = args.title;
     if (args.action !== undefined) body.action_number = Number(args.action);
@@ -483,7 +616,7 @@ async function ping(args) {
     if (ackTimeout !== undefined) body.ack_timeout_seconds = ackTimeout;
     result = await httpJson('POST', url, { body, headers: { Authorization: `Bearer ${token}` } });
   } else {
-    fail('provide a webhook (--webhook / PINGROOM_WEBHOOK_URL) or an agent token (--token / PINGROOM_TOKEN)', EXIT.USAGE);
+    fail('provide a webhook (--webhook / PINGROOM_WEBHOOK_URL) or an agent token (--token / PINGROOM_TOKEN, or run "pingroom" to connect)', EXIT.USAGE);
   }
 
   const { res, text, json } = result;
@@ -631,14 +764,15 @@ async function live(args) {
   if (!correlationId) fail('--correlation-id is required', EXIT.USAGE);
 
   const webhook = args.webhook || process.env.PINGROOM_WEBHOOK_URL;
-  const token = args.token || process.env.PINGROOM_TOKEN;
-  const apiBase = (args.api || DEFAULT_API).replace(/\/$/, '');
+  const token = resolveToken(args);
+  const apiBase = resolveApiBase(args);
+  const room = resolveRoom(args);
 
   if (sub === 'get') {
     if (!token) fail('live get requires an agent token (--token or PINGROOM_TOKEN)', EXIT.USAGE);
-    if (!args.room) fail('--room is required', EXIT.USAGE);
+    if (!room) fail('--room is required', EXIT.USAGE);
     requireSafeUrl('--api', apiBase);
-    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(args.room)}/live/${encodeURIComponent(correlationId)}`;
+    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(room)}/live/${encodeURIComponent(correlationId)}`;
     const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
     if (args.json) process.stdout.write(`${text || '{}'}\n`);
     if (!res.ok) {
@@ -724,12 +858,12 @@ async function live(args) {
     requireSafeUrl('--webhook', webhook);
     result = await httpJson('POST', webhook, { body });
   } else if (token) {
-    if (!args.room) fail('--room is required when using --token', EXIT.USAGE);
+    if (!room) fail('--room is required when using --token (or set one with "pingroom config set default_room <code>")', EXIT.USAGE);
     requireSafeUrl('--api', apiBase);
-    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(args.room)}/live`;
+    const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(room)}/live`;
     result = await httpJson('POST', url, { body, headers: { Authorization: `Bearer ${token}` } });
   } else {
-    fail('provide a webhook (--webhook / PINGROOM_WEBHOOK_URL) or an agent token (--token / PINGROOM_TOKEN)', EXIT.USAGE);
+    fail('provide a webhook (--webhook / PINGROOM_WEBHOOK_URL) or an agent token (--token / PINGROOM_TOKEN, or run "pingroom" to connect)', EXIT.USAGE);
   }
 
   const { res, text, json } = result;
@@ -749,13 +883,24 @@ async function live(args) {
 
 // --- questions -------------------------------------------------------------
 
+// Resolve the credential + endpoint a token-only command needs. When nothing is
+// available this is a usage error pointing at PINGROOM_TOKEN — never a prompt,
+// so a CI job fails in a second instead of hanging on an invisible question.
 function agentContext(args, { needRoom = false } = {}) {
-  const token = args.token || process.env.PINGROOM_TOKEN;
-  if (!token) fail('an agent token is required (--token or PINGROOM_TOKEN)', EXIT.USAGE);
-  const apiBase = (args.api || DEFAULT_API).replace(/\/$/, '');
+  const token = resolveToken(args);
+  if (!token) {
+    fail(
+      'an agent token is required (--token or PINGROOM_TOKEN). Run "pingroom" in an interactive terminal to connect this machine; in CI set PINGROOM_TOKEN.',
+      EXIT.USAGE,
+    );
+  }
+  const apiBase = resolveApiBase(args);
   requireSafeUrl('--api', apiBase);
-  if (needRoom && !args.room) fail('--room is required', EXIT.USAGE);
-  return { token, apiBase, room: args.room };
+  const room = resolveRoom(args);
+  if (needRoom && !room) {
+    fail('--room is required (or set one with "pingroom config set default_room <code>")', EXIT.USAGE);
+  }
+  return { token, apiBase, room };
 }
 
 // value:label -> {value, label}. Labels may contain colons (only the first
@@ -1456,14 +1601,471 @@ async function hook(args) {
   if (raw) { try { event = JSON.parse(raw); } catch { event = {}; } }
   const name = event.hook_event_name || '';
 
-  const token = args.token || process.env.PINGROOM_TOKEN;
-  const room = args.room || process.env.PINGROOM_ROOM;
-  const apiBase = (args.api || DEFAULT_API).replace(/\/$/, '');
+  // The hook fails open, so it reads the same layered config as everything else
+  // but never complains about a missing piece — it just defers.
+  const token = resolveToken(args);
+  const room = resolveRoom(args);
+  const apiBase = resolveApiBase(args);
 
   if (name === 'PreToolUse') {
     return hookPreToolUse(event, { token, room, apiBase, args });
   }
   return hookNotify(event, name, { token, room, apiBase, args });
+}
+
+// --- connecting (pairing + email fallback) ---------------------------------
+//
+// Wire contract: AGENT_PAIRING_SPEC.md. The shape is deliberately one gesture —
+// scanning the QR is where the human picks BOTH the account and the delivery
+// room, so an agent can never end up connected with nobody's say-so about where
+// it pings. There is no `login` subcommand: `pingroom` resolves the state.
+
+// The scopes this CLI can actually use, one per command surface. Requested at
+// registration so the approval screen shows exactly what it is granting; the
+// server intersects, so asking for less is always safe and asking for more than
+// the human approves is impossible.
+const CLI_SCOPES = [
+  'pingroom:rooms:read',        // resolve/display the connected room
+  'pingroom:broadcast:send',    // ping
+  'pingroom:questions:ask',     // ask / watch / cancel / list, and the hook
+  'pingroom:handoffs:create',   // handoff / handoffs
+  'pingroom:live:write',        // live start/update/end/get
+];
+
+const AGENT_LABEL = 'pingroom-cli';
+
+// Widest QR we render (compact half-block form of a ~110-char pair URL is 39
+// columns). Anything narrower would wrap and become unscannable, so we print
+// the URL alone instead of a broken QR.
+const QR_MIN_COLUMNS = 41;
+
+/**
+ * Draw the pair URL as a scannable QR. Returns false when it could not — a too
+ * narrow terminal, or the optional dependency being absent (someone vendored
+ * just bin/) — and the caller falls back to the printed URL, which always works.
+ */
+async function renderQr(url) {
+  // A real terminal reports its width on the stream; COLUMNS covers the rest.
+  // Unknown width is treated as wide enough — the URL is printed either way.
+  const columns = Number(process.stdout.columns || process.env.COLUMNS || 0);
+  if (columns > 0 && columns < QR_MIN_COLUMNS) return false;
+
+  let qr;
+  try {
+    const mod = await import('qrcode-terminal');
+    qr = mod.default || mod;
+  } catch { return false; }
+  if (!qr || typeof qr.generate !== 'function') return false;
+
+  try {
+    let art = '';
+    // Call it as a method: qrcode-terminal reads its error-correction level off
+    // `this`, so a detached `generate` reference silently builds a version-1
+    // code and throws on anything longer than a few characters.
+    // `small` is the half-block form: two module rows per text row, so the code
+    // stays square-ish and fits an 80-column terminal.
+    qr.generate(url, { small: true }, (rendered) => { art = rendered; });
+    if (!art) return false;
+    process.stdout.write(`\n${art}\n`);
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * A line-at-a-time reader over stdin.
+ *
+ * Deliberately not node:readline: its Interface keeps consuming while we are
+ * awaiting an HTTP round trip between two questions and drops the lines nobody
+ * is listening for, which silently loses piped answers. This queues every line
+ * instead, so the answers can arrive in one blob or one keystroke at a time.
+ * A closed input resolves '' rather than hanging, so the caller falls through to
+ * its own "this is required" error instead of blocking forever.
+ */
+function createPrompter() {
+  const queued = [];
+  const waiting = [];
+  let buffer = '';
+  let closed = false;
+
+  const deliver = (line) => {
+    const waiter = waiting.shift();
+    if (waiter) waiter(line);
+    else queued.push(line);
+  };
+  const onData = (chunk) => {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      deliver(buffer.slice(0, idx).replace(/\r$/, ''));
+      buffer = buffer.slice(idx + 1);
+    }
+  };
+  const onEnd = () => {
+    if (closed) return;
+    closed = true;
+    if (buffer) { deliver(buffer); buffer = ''; }
+    while (waiting.length) waiting.shift()('');
+  };
+
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', onData);
+  process.stdin.once('end', onEnd);
+  process.stdin.resume();
+
+  return {
+    ask(question) {
+      process.stdout.write(question);
+      if (queued.length > 0) return Promise.resolve(queued.shift());
+      if (closed) return Promise.resolve('');
+      return new Promise((resolve) => { waiting.push(resolve); });
+    },
+    close() {
+      process.stdin.off('data', onData);
+      process.stdin.off('end', onEnd);
+      process.stdin.pause();
+    },
+  };
+}
+
+/** POST /api/agent/auth — anonymous registration, yields the pre-claim credential. */
+async function registerAnonymous(apiBase) {
+  const { res, json } = await httpJson('POST', `${apiBase}/api/agent/auth`, {
+    body: { type: 'anonymous', agent_label: AGENT_LABEL, scopes: CLI_SCOPES },
+  });
+  if (!res.ok || !json || typeof json.credential !== 'string') {
+    const detail = (json && (json.message || json.error || json.code)) || `HTTP ${res.status}`;
+    fail(`could not start a connection: ${detail}`);
+  }
+  return json.credential;
+}
+
+/** Persist the active credential plus the bits the status line prints. */
+function saveCredential({ token, handle, room, account, scopes, apiBase }) {
+  writeJsonFile(credentialsPath(), {
+    version: 1,
+    token,
+    handle: handle || null,
+    room: room || null,
+    account: account || null,
+    scopes: scopes || [],
+    api_url: apiBase,
+    created_at: new Date().toISOString(),
+  });
+}
+
+/** "✓ Connected as @agt_ab12 → #Project X" — the room half is omitted if unknown. */
+function connectedLine(cred) {
+  const who = cred.handle ? `@${cred.handle}` : 'this machine';
+  const room = cred.room && (cred.room.name || cred.room.invite_code);
+  return `✓ Connected as ${who}${room ? ` → #${room}` : ''}`;
+}
+
+/**
+ * The QR path. Mints a pre-claim credential, asks the server for a pairing
+ * token, renders it, then polls until the human approves. Returns a credential
+ * object, or null when the pairing lapsed and the user declined a fresh one.
+ */
+async function connectByPairing(apiBase, ask) {
+  for (;;) {
+    const preClaim = await registerAnonymous(apiBase);
+    const headers = { Authorization: `Bearer ${preClaim}` };
+
+    const start = await httpJson('POST', `${apiBase}/api/agent/auth/pair/start`, {
+      body: { scopes: CLI_SCOPES },
+      headers,
+    });
+    if (!start.res.ok || !start.json || typeof start.json.pair_url !== 'string') {
+      const detail = (start.json && (start.json.message || start.json.error || start.json.code))
+        || `HTTP ${start.res.status}`;
+      fail(`could not start pairing: ${detail}`);
+    }
+
+    const pairUrl = start.json.pair_url;
+    // 900s is the server's pre-claim lifetime; never poll past it, and clamp the
+    // server's suggested interval so a bad value can't busy-loop or stall.
+    const lifetimeMs = Math.max(1, Number(start.json.expires_in) || 900) * 1000;
+    const intervalMs = Math.min(Math.max(Number(start.json.poll_interval_ms) || 1500, 250), 10_000);
+    const deadline = Date.now() + lifetimeMs;
+
+    const drew = await renderQr(pairUrl);
+    process.stdout.write(`${drew ? '  Or open' : '  Open'}: ${pairUrl}\n`);
+    process.stdout.write('  Waiting for approval… ');
+
+    let outcome = 'expired';
+    while (Date.now() < deadline) {
+      const { res, json } = await httpJson('GET', `${apiBase}/api/agent/auth/pair/status`, { headers });
+      if (!res.ok) {
+        process.stdout.write('\n');
+        const detail = (json && (json.message || json.error || json.code)) || `HTTP ${res.status}`;
+        fail(`pairing failed: ${detail}`);
+      }
+      const status = json && json.status;
+      if (status === 'active') {
+        if (typeof json.credential !== 'string' || json.credential === '') {
+          process.stdout.write('\n');
+          fail('pairing succeeded but the server returned no credential');
+        }
+        outcome = 'active';
+        const cred = {
+          token: json.credential,
+          handle: json.handle,
+          room: json.room,
+          account: json.account,
+          scopes: json.scopes,
+          apiBase,
+        };
+        saveCredential(cred);
+        process.stdout.write(`${connectedLine(cred)}\n`);
+        return cred;
+      }
+      if (status === 'expired') break;
+      // `pending` (or anything unrecognized) — keep waiting.
+      await sleep(intervalMs);
+    }
+
+    process.stdout.write(`\n  That code expired.\n`);
+    if (outcome !== 'expired') return null;
+    const again = (await ask('  Show a fresh QR code? [Y/n]: ')).trim().toLowerCase();
+    if (again && again !== 'y' && again !== 'yes') return null;
+  }
+}
+
+/**
+ * The email fallback, over the unchanged claim/* endpoints: the server mails a
+ * link, the web page shows a 6-digit code, the user reads it back here.
+ */
+async function connectByEmail(apiBase, ask) {
+  const preClaim = await registerAnonymous(apiBase);
+  const headers = { Authorization: `Bearer ${preClaim}` };
+
+  const email = (await ask('  Your PingRoom email: ')).trim();
+  if (!email) fail('an email address is required', EXIT.USAGE);
+
+  const start = await httpJson('POST', `${apiBase}/api/agent/auth/claim/start`, {
+    body: { email },
+    headers,
+  });
+  if (!start.res.ok) {
+    const detail = (start.json && (start.json.message || start.json.error || start.json.code))
+      || `HTTP ${start.res.status}`;
+    fail(`could not send the email: ${detail}`);
+  }
+
+  process.stdout.write('  Sent. Open the link in that email — the page shows a 6-digit code.\n');
+
+  // A mistyped code is the common case, so allow a few tries before giving up.
+  // The server locks the registration out after its own attempt cap anyway.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const otp = (await ask('  Code: ')).trim();
+    const done = await httpJson('POST', `${apiBase}/api/agent/auth/claim/complete`, {
+      body: { email, otp },
+      headers,
+    });
+    if (done.res.ok && done.json && typeof done.json.credential === 'string') {
+      const cred = {
+        token: done.json.credential,
+        handle: done.json.handle,
+        // claim/complete carries no room — the email flow does not choose one.
+        room: done.json.room,
+        account: done.json.account,
+        scopes: done.json.scopes,
+        apiBase,
+      };
+      saveCredential(cred);
+      process.stdout.write(`${connectedLine(cred)}\n`);
+      if (!cred.room) {
+        process.stdout.write('  Pick a delivery room with: pingroom config set default_room <invite code>\n');
+      }
+      return cred;
+    }
+    const detail = (done.json && (done.json.message || done.json.error || done.json.code))
+      || `HTTP ${done.res.status}`;
+    if (attempt === 3) fail(`could not connect: ${detail}`);
+    process.stderr.write(`pingroom: ${detail}\n`);
+  }
+  return null;
+}
+
+/**
+ * Resolve the unconnected state interactively. Refuses outright when there is no
+ * TTY — a hung prompt in CI is worse than a clean failure, and the fix there is
+ * PINGROOM_TOKEN, not a QR nobody can scan.
+ */
+async function connect(args) {
+  if (!isInteractive()) {
+    fail(
+      'not connected, and this is not an interactive terminal. Set PINGROOM_TOKEN (CI, pipes), or run "pingroom" from a terminal to pair.',
+      EXIT.USAGE,
+    );
+  }
+
+  const apiBase = resolveApiBase(args);
+  requireSafeUrl('--api', apiBase);
+
+  const prompter = createPrompter();
+  const ask = (question) => prompter.ask(question);
+  try {
+    process.stdout.write('  Not connected. How do you want to connect?\n');
+    process.stdout.write('    1) Scan a QR code with the PingRoom app\n');
+    process.stdout.write('    2) Email me a code\n');
+    const choice = (await ask('  Choose [1]: ')).trim();
+    if (choice && choice !== '1' && choice !== '2') {
+      process.stderr.write('pingroom: choose 1 or 2\n');
+      return EXIT.USAGE;
+    }
+
+    const cred = choice === '2'
+      ? await connectByEmail(apiBase, ask)
+      : await connectByPairing(apiBase, ask);
+
+    return cred ? EXIT.OK : EXIT.EXPIRED;
+  } finally {
+    prompter.close();
+  }
+}
+
+// --- status / bare invocation ----------------------------------------------
+
+/**
+ * `pingroom` with no arguments. Connected -> one status line then the usual
+ * help. Not connected -> pair (interactive) or, in a pipe/CI, say so on stderr
+ * and still print the help rather than prompting into the void.
+ */
+async function bare(args) {
+  const envToken = process.env.PINGROOM_TOKEN;
+  const stored = readStoredCredential();
+
+  if (envToken) {
+    process.stdout.write('Using the agent token from PINGROOM_TOKEN.\n');
+    if (stored) process.stdout.write(`(the stored credential in ${credentialsPath()} is ignored while it is set)\n`);
+    const room = resolveRoom(args);
+    if (room) process.stdout.write(`Default room: ${room}\n`);
+    process.stdout.write(`\n${HELP}\n`);
+    return EXIT.OK;
+  }
+
+  if (stored) {
+    process.stdout.write(`${connectedLine(stored)}\n`);
+    const room = resolveRoom(args);
+    if (room) process.stdout.write(`Default room: ${room}\n`);
+    process.stdout.write(`\n${HELP}\n`);
+    return EXIT.OK;
+  }
+
+  if (!isInteractive()) {
+    process.stderr.write('pingroom: not connected. Set PINGROOM_TOKEN, or run "pingroom" from an interactive terminal to pair.\n');
+    process.stdout.write(`${HELP}\n`);
+    return EXIT.OK;
+  }
+
+  return connect(args);
+}
+
+// --- config ----------------------------------------------------------------
+
+// Only these keys are storable. An unknown key is a usage error rather than a
+// silently-ignored setting the user then blames the tool for not honouring.
+const CONFIG_KEYS = {
+  default_room: {
+    describe: 'Room invite code used when --room / PINGROOM_ROOM is absent',
+    validate: (value) => {
+      if (/\s/.test(value) || value.length > 64) return 'default_room must be an invite code (no spaces, <= 64 chars)';
+      return null;
+    },
+  },
+  api_url: {
+    describe: `API base URL (default ${BUILTIN_API})`,
+    validate: (value) => {
+      let u;
+      try { u = new URL(value); } catch { return 'api_url must be a valid URL'; }
+      const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+      if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) {
+        return 'api_url must use https (refusing to send credentials over cleartext)';
+      }
+      return null;
+    },
+  },
+};
+
+async function config(args) {
+  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+
+  const sub = args._[0];
+  const known = ['list', 'get', 'set'];
+  if (!sub || !known.includes(sub)) {
+    fail(`config needs a subcommand: ${known.join(' | ')}`, EXIT.USAGE);
+  }
+
+  const stored = readConfigFile();
+
+  if (sub === 'list') {
+    if (args.json) { process.stdout.write(`${JSON.stringify(stored)}\n`); return EXIT.OK; }
+    const keys = Object.keys(CONFIG_KEYS).filter((k) => stored[k] !== undefined && stored[k] !== '');
+    if (keys.length === 0) {
+      process.stdout.write(`no settings stored in ${configPath()}\n`);
+      return EXIT.OK;
+    }
+    for (const key of keys) process.stdout.write(`${key}=${stored[key]}\n`);
+    return EXIT.OK;
+  }
+
+  const key = args._[1];
+  if (!key) fail(`config ${sub} needs a key (${Object.keys(CONFIG_KEYS).join(', ')})`, EXIT.USAGE);
+  if (!Object.hasOwn(CONFIG_KEYS, key)) {
+    fail(`unknown config key: ${key} (known keys: ${Object.keys(CONFIG_KEYS).join(', ')})`, EXIT.USAGE);
+  }
+
+  if (sub === 'get') {
+    const value = stored[key];
+    if (value === undefined || value === '') return EXIT.OK; // unset: print nothing, exit 0
+    process.stdout.write(`${value}\n`);
+    return EXIT.OK;
+  }
+
+  // set
+  const raw = args._[2];
+  if (raw === undefined) fail(`config set needs a value (pass "" to clear ${key})`, EXIT.USAGE);
+  const value = String(raw).trim();
+
+  if (value === '') {
+    delete stored[key];
+    writeJsonFile(configPath(), stored);
+    process.stdout.write(`${key} cleared\n`);
+    return EXIT.OK;
+  }
+
+  const problem = CONFIG_KEYS[key].validate(value);
+  if (problem) fail(problem, EXIT.USAGE);
+
+  stored[key] = value;
+  writeJsonFile(configPath(), stored);
+  process.stdout.write(`${key}=${value}\n`);
+  return EXIT.OK;
+}
+
+// --- logout ----------------------------------------------------------------
+
+async function logout(args) {
+  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+
+  const path = credentialsPath();
+  const stored = readStoredCredential();
+  try {
+    unlinkSync(path);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      process.stdout.write('not connected — there was no stored credential to clear\n');
+      return EXIT.OK;
+    }
+    fail(`could not clear ${path}: ${err.message}`);
+  }
+
+  const who = stored && stored.handle ? ` (@${stored.handle})` : '';
+  process.stdout.write(`logged out${who} — cleared ${path}\n`);
+  if (process.env.PINGROOM_TOKEN) {
+    process.stdout.write('note: PINGROOM_TOKEN is still set in this environment and will keep being used\n');
+  }
+  return EXIT.OK;
 }
 
 const COMMANDS = {
@@ -1477,6 +2079,8 @@ const COMMANDS = {
   handoffs: (rest) => listHandoffs(parseQArgs(rest)),
   hook: (rest) => hook(parseHookArgs(rest)),
   live: (rest) => live(parseLiveArgs(rest)),
+  config: (rest) => config(parseQArgs(rest)),
+  logout: (rest) => logout(parseQArgs(rest)),
 };
 
 function waitFrom(handler, rest) {
@@ -1487,9 +2091,17 @@ async function main() {
   const argv = process.argv.slice(2);
   const command = argv[0];
 
-  if (!command || command === '-h' || command === '--help' || command === 'help') {
+  if (command === '-h' || command === '--help' || command === 'help') {
     process.stdout.write(`${HELP}\n`);
     process.exit(EXIT.OK);
+  }
+
+  // Bare `pingroom` resolves the auth state instead of only printing help:
+  // connected -> status + help; not connected -> pair (interactive only).
+  // A leading flag with no subcommand (`pingroom --api …`) counts as bare — it
+  // configures the connect attempt rather than naming a command.
+  if (!command || command.startsWith('-')) {
+    process.exit(await bare(parseQArgs(argv)));
   }
 
   const handler = COMMANDS[command];

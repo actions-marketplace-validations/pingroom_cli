@@ -4,7 +4,7 @@ import { spawnSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -61,13 +61,26 @@ test('package version matches the GitHub Action CLI pin', () => {
  * Pass `env` overrides for credential/endpoint config. PINGROOM_* env vars
  * are stripped by default so the host machine's config can't leak in.
  */
-function run(args, env = {}) {
+// A throwaway PINGROOM_HOME shared by every run that doesn't ask for its own,
+// so the developer's real ~/.pingroom (paired credential, default_room) can
+// never change what a test sees.
+const EMPTY_HOME = mkdtempSync(join(tmpdir(), 'pingroom-empty-'));
+
+/** Strip every PINGROOM_* input and pin the local state at an empty directory. */
+function baseEnv() {
   const cleanEnv = { ...process.env };
   delete cleanEnv.PINGROOM_WEBHOOK_URL;
   delete cleanEnv.PINGROOM_TOKEN;
   delete cleanEnv.PINGROOM_API_URL;
+  delete cleanEnv.PINGROOM_ROOM;
+  delete cleanEnv.PINGROOM_FORCE_TTY;
+  cleanEnv.PINGROOM_HOME = EMPTY_HOME;
+  return cleanEnv;
+}
+
+function run(args, env = {}) {
   const r = spawnSync(process.execPath, [CLI, ...args], {
-    env: { ...cleanEnv, ...env },
+    env: { ...baseEnv(), ...env },
     encoding: 'utf8',
   });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
@@ -77,15 +90,15 @@ function run(args, env = {}) {
  * Async variant for tests that need an in-process stub server: spawnSync would
  * block the event loop and deadlock against a localhost server running in the
  * same process, so use async spawn and resolve on close.
+ *
+ * `stdin` feeds the interactive prompts (the connect picker, email, OTP); it is
+ * written as one blob and the pipe is closed, which is enough because every
+ * prompt is answered in order.
  */
-function runAsync(args, env = {}) {
-  const cleanEnv = { ...process.env };
-  delete cleanEnv.PINGROOM_WEBHOOK_URL;
-  delete cleanEnv.PINGROOM_TOKEN;
-  delete cleanEnv.PINGROOM_API_URL;
+function runAsync(args, env = {}, { stdin } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, ...args], {
-      env: { ...cleanEnv, ...env },
+      env: { ...baseEnv(), ...env },
     });
     let stdout = '';
     let stderr = '';
@@ -93,6 +106,8 @@ function runAsync(args, env = {}) {
     child.stderr.on('data', (c) => (stderr += c));
     child.on('error', reject);
     child.on('close', (status) => resolve({ status, stdout, stderr }));
+    if (stdin !== undefined) child.stdin.write(stdin);
+    child.stdin.end();
   });
 }
 
@@ -931,14 +946,9 @@ test('handoff exits 1 on a generic server error', async () => {
 
 /** Run the CLI with a hook event piped to stdin, resolving on close. */
 function runHook(args, stdin, env = {}) {
-  const cleanEnv = { ...process.env };
-  delete cleanEnv.PINGROOM_WEBHOOK_URL;
-  delete cleanEnv.PINGROOM_TOKEN;
-  delete cleanEnv.PINGROOM_API_URL;
-  delete cleanEnv.PINGROOM_ROOM;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, 'hook', ...args], {
-      env: { ...cleanEnv, ...env },
+      env: { ...baseEnv(), ...env },
     });
     let stdout = '';
     let stderr = '';
@@ -1373,4 +1383,472 @@ test('live start sends category=alert for a time-sensitive stream', async () => 
   } finally {
     server.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Connecting: credential store, config, pairing, logout
+// ---------------------------------------------------------------------------
+
+/** A fresh, isolated PINGROOM_HOME. */
+function newHome() {
+  return mkdtempSync(join(tmpdir(), 'pingroom-home-'));
+}
+
+/** Seed a credentials.json the way a completed pairing would have written it. */
+function seedCredential(home, cred) {
+  writeFileSync(join(home, 'credentials.json'), `${JSON.stringify({ version: 1, ...cred })}\n`, { mode: 0o600 });
+}
+
+/**
+ * Stub the pairing endpoints. `statuses` is consumed one entry per poll; the
+ * last entry repeats. `rounds` counts how many times pairing was restarted.
+ */
+function pairingServer(statuses, { onRegister } = {}) {
+  const received = [];
+  let poll = 0;
+  return startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const path = req.url.split('?')[0];
+      received.push({ method: req.method, path, auth: req.headers['authorization'], body });
+      let out;
+      if (path === '/api/agent/auth') {
+        if (onRegister) onRegister();
+        out = { status: 200, body: { credential: 'pre_claim_jwt', credential_type: 'pre_claim', expires_in: 900, scopes: [] } };
+      } else if (path === '/api/agent/auth/pair/start') {
+        out = {
+          status: 200,
+          body: {
+            pair_token: 'p'.repeat(64),
+            pair_url: `https://pingroom.io/app/agents/pair?token=${'p'.repeat(64)}`,
+            expires_in: 900,
+            poll_interval_ms: 10,
+          },
+        };
+      } else if (path === '/api/agent/auth/pair/status') {
+        out = { status: 200, body: statuses[Math.min(poll++, statuses.length - 1)] };
+      } else {
+        out = { status: 404, body: { message: 'no route' } };
+      }
+      res.writeHead(out.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(out.body));
+    });
+  }).then((s) => ({ ...s, received }));
+}
+
+const ACTIVE_PAIR = {
+  status: 'active',
+  credential: 'active_jwt',
+  credential_type: 'active',
+  expires_in: 0,
+  handle: 'agt_ab12cd34ef',
+  scopes: ['pingroom:broadcast:send'],
+  account: { name: 'Mahdi' },
+  room: { invite_code: 'ABC123', name: 'Project X' },
+};
+
+test('stored credential supplies the token and the room when no env/flag does', async () => {
+  const home = newHome();
+  seedCredential(home, { token: 'stored_tok', handle: 'agt_x', room: { invite_code: 'ABC123', name: 'Project X' } });
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ABC123/notifications': () => ({ status: 201, body: { id: 'n1' } }),
+  });
+  try {
+    const { status, stdout } = await runAsync(['ping', '--api', baseUrl, '-m', 'hi'], { PINGROOM_HOME: home });
+    assert.equal(status, 0);
+    assert.match(stdout, /ping sent/);
+    assert.equal(received[0].path, '/api/agent/rooms/ABC123/notifications');
+    assert.equal(received[0].auth, 'Bearer stored_tok');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('PINGROOM_TOKEN always wins over the stored credential (CI is unaffected)', async () => {
+  const home = newHome();
+  seedCredential(home, { token: 'stored_tok', handle: 'agt_x', room: { invite_code: 'ABC123', name: 'Project X' } });
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ABC123/notifications': () => ({ status: 201, body: { id: 'n1' } }),
+  });
+  try {
+    const { status } = await runAsync(['ping', '--api', baseUrl, '-m', 'hi'], { PINGROOM_HOME: home, PINGROOM_TOKEN: 'env_tok' });
+    assert.equal(status, 0);
+    assert.equal(received[0].auth, 'Bearer env_tok');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('--token outranks both the env var and the stored credential', async () => {
+  const home = newHome();
+  seedCredential(home, { token: 'stored_tok', room: { invite_code: 'ABC123' } });
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ABC123/notifications': () => ({ status: 201, body: { id: 'n1' } }),
+  });
+  try {
+    const { status } = await runAsync(
+      ['ping', '--api', baseUrl, '-m', 'hi', '--token', 'flag_tok'],
+      { PINGROOM_HOME: home, PINGROOM_TOKEN: 'env_tok' },
+    );
+    assert.equal(status, 0);
+    assert.equal(received[0].auth, 'Bearer flag_tok');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a corrupt credentials.json degrades to "not connected" instead of crashing', () => {
+  const home = newHome();
+  try {
+    writeFileSync(join(home, 'credentials.json'), 'not json at all');
+    const { status, stderr } = run(['ask', '--room', 'ab12cd', '-p', 'Deploy?'], { PINGROOM_HOME: home });
+    assert.equal(status, 2);
+    assert.match(stderr, /agent token is required/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('config set/get/list round-trips and rejects unknown keys and bad values', () => {
+  const home = newHome();
+  try {
+    assert.match(run(['config', 'list'], { PINGROOM_HOME: home }).stdout, /no settings stored/);
+
+    const set = run(['config', 'set', 'default_room', 'ab12cd'], { PINGROOM_HOME: home });
+    assert.equal(set.status, 0);
+    assert.match(set.stdout, /^default_room=ab12cd$/m);
+
+    assert.equal(run(['config', 'get', 'default_room'], { PINGROOM_HOME: home }).stdout, 'ab12cd\n');
+    // Unset keys print nothing and still exit 0, so `$(pingroom config get …)` is safe.
+    const unset = run(['config', 'get', 'api_url'], { PINGROOM_HOME: home });
+    assert.equal(unset.status, 0);
+    assert.equal(unset.stdout, '');
+
+    run(['config', 'set', 'api_url', 'https://api.example.test'], { PINGROOM_HOME: home });
+    const listed = run(['config', 'list'], { PINGROOM_HOME: home });
+    assert.match(listed.stdout, /^default_room=ab12cd$/m);
+    assert.match(listed.stdout, /^api_url=https:\/\/api\.example\.test$/m);
+
+    const unknown = run(['config', 'set', 'nope', 'x'], { PINGROOM_HOME: home });
+    assert.equal(unknown.status, 2);
+    assert.match(unknown.stderr, /unknown config key/);
+
+    const cleartext = run(['config', 'set', 'api_url', 'http://evil.example'], { PINGROOM_HOME: home });
+    assert.equal(cleartext.status, 2);
+    assert.match(cleartext.stderr, /must use https/);
+
+    // An empty value clears the key rather than storing "".
+    assert.match(run(['config', 'set', 'api_url', ''], { PINGROOM_HOME: home }).stdout, /api_url cleared/);
+    assert.equal(run(['config', 'get', 'api_url'], { PINGROOM_HOME: home }).stdout, '');
+
+    const noSub = run(['config'], { PINGROOM_HOME: home });
+    assert.equal(noSub.status, 2);
+    assert.match(noSub.stderr, /config needs a subcommand/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('config default_room fills in for --room, and the flag/env still outrank it', async () => {
+  const home = newHome();
+  run(['config', 'set', 'default_room', 'cfgroom'], { PINGROOM_HOME: home });
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/cfgroom/questions': () => ({ status: 201, body: { id: 'q_cfg', state: 'pending' } }),
+    'POST /api/agent/rooms/envroom/questions': () => ({ status: 201, body: { id: 'q_env', state: 'pending' } }),
+    'POST /api/agent/rooms/flagroom/questions': () => ({ status: 201, body: { id: 'q_flag', state: 'pending' } }),
+  });
+  try {
+    const cfg = await runAsync(['ask', '--api', baseUrl, '--token', 't', '-p', 'Go?'], { PINGROOM_HOME: home });
+    assert.equal(cfg.status, 0);
+    assert.equal(cfg.stdout.trim(), 'q_cfg');
+
+    const env = await runAsync(['ask', '--api', baseUrl, '--token', 't', '-p', 'Go?'], { PINGROOM_HOME: home, PINGROOM_ROOM: 'envroom' });
+    assert.equal(env.stdout.trim(), 'q_env');
+
+    const flag = await runAsync(
+      ['ask', '--api', baseUrl, '--token', 't', '--room', 'flagroom', '-p', 'Go?'],
+      { PINGROOM_HOME: home, PINGROOM_ROOM: 'envroom' },
+    );
+    assert.equal(flag.stdout.trim(), 'q_flag');
+    assert.deepEqual(received.map((r) => r.path), [
+      '/api/agent/rooms/cfgroom/questions',
+      '/api/agent/rooms/envroom/questions',
+      '/api/agent/rooms/flagroom/questions',
+    ]);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('config api_url becomes the API base when no flag or env var is given', async () => {
+  const home = newHome();
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_cfgapi', state: 'pending' } }),
+  });
+  try {
+    // A loopback http base is the one cleartext exception, for local dev.
+    run(['config', 'set', 'api_url', baseUrl], { PINGROOM_HOME: home });
+    const { status, stdout } = await runAsync(
+      ['ask', '--token', 't', '--room', 'ab12cd', '-p', 'Go?'],
+      { PINGROOM_HOME: home },
+    );
+    assert.equal(status, 0);
+    assert.equal(stdout.trim(), 'q_cfgapi');
+    assert.equal(received.length, 1);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bare pingroom prints the connected status and the help', () => {
+  const home = newHome();
+  seedCredential(home, { token: 'stored_tok', handle: 'agt_ab12cd34ef', room: { invite_code: 'ABC123', name: 'Project X' } });
+  try {
+    const { status, stdout } = run([], { PINGROOM_HOME: home });
+    assert.equal(status, 0);
+    assert.match(stdout, /Connected as @agt_ab12cd34ef → #Project X/);
+    assert.match(stdout, /Default room: ABC123/);
+    assert.match(stdout, /pingroom — send a ping/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bare pingroom reports the env token instead of the stored credential', () => {
+  const home = newHome();
+  seedCredential(home, { token: 'stored_tok', handle: 'agt_ab12cd34ef' });
+  try {
+    const { status, stdout } = run([], { PINGROOM_HOME: home, PINGROOM_TOKEN: 'env_tok' });
+    assert.equal(status, 0);
+    assert.match(stdout, /Using the agent token from PINGROOM_TOKEN/);
+    assert.match(stdout, /is ignored while it is set/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('non-TTY: bare pingroom never prompts or draws a QR, and points at PINGROOM_TOKEN', () => {
+  // spawnSync pipes both streams, so this is exactly the CI shape. It must
+  // return immediately rather than block on an invisible prompt.
+  const { status, stdout, stderr } = run([]);
+  assert.equal(status, 0);
+  assert.match(stderr, /not connected/);
+  assert.match(stderr, /PINGROOM_TOKEN/);
+  assert.match(stdout, /pingroom — send a ping/);
+  assert.doesNotMatch(stdout, /[█▄▀]/);
+  assert.doesNotMatch(stdout, /Choose \[1\]/);
+});
+
+test('non-TTY: a command needing a credential fails with the usage code, not a prompt', () => {
+  for (const argv of [['ask', '--room', 'ab12cd', '-p', 'Deploy?'], ['handoff', '-m', 'Ship it']]) {
+    const { status, stdout, stderr } = run(argv);
+    assert.equal(status, 2, `${argv[0]} should be a usage error`);
+    assert.match(stderr, /PINGROOM_TOKEN/);
+    assert.doesNotMatch(stdout, /Choose \[1\]/);
+  }
+});
+
+test('pairing renders a QR, polls to active, and stores a 0600 credential', async () => {
+  const home = newHome();
+  const { server, baseUrl, received } = await pairingServer([
+    { status: 'pending' },
+    { status: 'pending' },
+    ACTIVE_PAIR,
+  ]);
+  try {
+    const { status, stdout } = await runAsync(
+      ['--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '120' },
+      { stdin: '\n' }, // accept the default picker choice (QR)
+    );
+    assert.equal(status, 0);
+    // The QR itself, then the URL fallback, then the confirmation.
+    assert.match(stdout, /[█▄▀]{4}/);
+    assert.match(stdout, /Or open: https:\/\/pingroom\.io\/app\/agents\/pair\?token=p{64}/);
+    assert.match(stdout, /✓ Connected as @agt_ab12cd34ef → #Project X/);
+
+    const paths = received.map((r) => r.path);
+    assert.equal(paths[0], '/api/agent/auth');
+    assert.equal(paths[1], '/api/agent/auth/pair/start');
+    assert.deepEqual(paths.slice(2), Array(3).fill('/api/agent/auth/pair/status'));
+
+    // Anonymous registration, with the scopes the CLI actually uses.
+    const register = JSON.parse(received[0].body);
+    assert.equal(register.type, 'anonymous');
+    assert.ok(register.scopes.includes('pingroom:handoffs:create'));
+    assert.ok(register.scopes.includes('pingroom:questions:ask'));
+    // pair/start and every poll present the pre-claim credential.
+    assert.equal(received[1].auth, 'Bearer pre_claim_jwt');
+    assert.deepEqual(JSON.parse(received[1].body).scopes, register.scopes);
+    for (const poll of received.slice(2)) assert.equal(poll.auth, 'Bearer pre_claim_jwt');
+
+    const credPath = join(home, 'credentials.json');
+    const cred = JSON.parse(readFileSync(credPath, 'utf8'));
+    assert.equal(cred.token, 'active_jwt');
+    assert.equal(cred.handle, 'agt_ab12cd34ef');
+    assert.deepEqual(cred.room, { invite_code: 'ABC123', name: 'Project X' });
+    assert.equal(statSync(credPath).mode & 0o777, 0o600);
+    assert.equal(statSync(home).mode & 0o777, 0o700);
+
+    // The paired room is the last-resort fallback for --room.
+    assert.equal(run(['config', 'get', 'default_room'], { PINGROOM_HOME: home }).stdout, '');
+    assert.match(run([], { PINGROOM_HOME: home }).stdout, /Default room: ABC123/);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('pairing offers a fresh QR when the pre-claim window expires', async () => {
+  const home = newHome();
+  let rounds = 0;
+  // First poll expires; after the user accepts a restart the new round is live.
+  const { server, baseUrl, received } = await pairingServer(
+    [{ status: 'expired' }, ACTIVE_PAIR],
+    { onRegister: () => { rounds += 1; } },
+  );
+  try {
+    const { status, stdout } = await runAsync(
+      ['--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '120' },
+      { stdin: '1\ny\n' },
+    );
+    assert.equal(status, 0);
+    assert.match(stdout, /That code expired\./);
+    assert.match(stdout, /Show a fresh QR code\?/);
+    assert.match(stdout, /✓ Connected as @agt_ab12cd34ef/);
+    assert.equal(rounds, 2, 'a restart must mint a brand new pre-claim registration');
+    assert.equal(received.filter((r) => r.path === '/api/agent/auth/pair/start').length, 2);
+    assert.equal(JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8')).token, 'active_jwt');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('declining a fresh QR exits 3 and writes no credential', async () => {
+  const home = newHome();
+  const { server, baseUrl } = await pairingServer([{ status: 'expired' }]);
+  try {
+    const { status, stdout } = await runAsync(
+      ['--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '120' },
+      { stdin: '1\nn\n' },
+    );
+    assert.equal(status, 3);
+    assert.match(stdout, /That code expired\./);
+    assert.throws(() => readFileSync(join(home, 'credentials.json'), 'utf8'));
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a narrow terminal degrades to the pair URL alone', async () => {
+  const home = newHome();
+  const { server, baseUrl } = await pairingServer([ACTIVE_PAIR]);
+  try {
+    const { status, stdout } = await runAsync(
+      ['--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1', COLUMNS: '20' },
+      { stdin: '1\n' },
+    );
+    assert.equal(status, 0);
+    assert.doesNotMatch(stdout, /[█▄▀]/);
+    assert.match(stdout, /Open: https:\/\/pingroom\.io\/app\/agents\/pair/);
+    assert.match(stdout, /✓ Connected as/);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the email fallback claims over the unchanged claim/* endpoints', async () => {
+  const home = newHome();
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/auth': () => ({
+      status: 200,
+      body: { credential: 'pre_claim_jwt', credential_type: 'pre_claim', expires_in: 900 },
+    }),
+    'POST /api/agent/auth/claim/start': () => ({
+      status: 200,
+      body: { message: 'Claim email sent.', expires_in: 900 },
+    }),
+    'POST /api/agent/auth/claim/complete': (body) => (JSON.parse(body).otp === '040176'
+      ? { status: 200, body: { credential: 'active_jwt', credential_type: 'active', expires_in: 0, handle: 'agt_email01', scopes: [] } }
+      : { status: 400, body: { error: 'invalid_otp', message: 'Invalid or expired code.' } }),
+  });
+  try {
+    const { status, stdout, stderr } = await runAsync(
+      ['--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_FORCE_TTY: '1' },
+      { stdin: '2\nme@example.com\n111111\n040176\n' }, // one wrong code, then the right one
+    );
+    assert.equal(status, 0, stderr);
+    assert.match(stdout, /Email me a code/);
+    assert.match(stdout, /the page shows a 6-digit code/);
+    assert.match(stderr, /Invalid or expired code/);
+    assert.match(stdout, /✓ Connected as @agt_email01/);
+    // No room comes back from the email flow, so the CLI says how to pick one.
+    assert.match(stdout, /pingroom config set default_room/);
+
+    const start = received.find((r) => r.path === '/api/agent/auth/claim/start');
+    assert.equal(start.auth, 'Bearer pre_claim_jwt');
+    assert.equal(JSON.parse(start.body).email, 'me@example.com');
+    // Never draws a QR on this branch.
+    assert.doesNotMatch(stdout, /[█▄▀]/);
+    assert.equal(JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8')).token, 'active_jwt');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('logout clears the credential, and says so when there was none', () => {
+  const home = newHome();
+  try {
+    const empty = run(['logout'], { PINGROOM_HOME: home });
+    assert.equal(empty.status, 0);
+    assert.match(empty.stdout, /no stored credential/);
+
+    seedCredential(home, { token: 'stored_tok', handle: 'agt_ab12cd34ef' });
+    const out = run(['logout'], { PINGROOM_HOME: home });
+    assert.equal(out.status, 0);
+    assert.match(out.stdout, /logged out \(@agt_ab12cd34ef\)/);
+    assert.throws(() => readFileSync(join(home, 'credentials.json'), 'utf8'));
+
+    // After logout the tool is back to "not connected", not half-authenticated.
+    const after = run(['ask', '--room', 'ab12cd', '-p', 'Deploy?'], { PINGROOM_HOME: home });
+    assert.equal(after.status, 2);
+    assert.match(after.stderr, /agent token is required/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('logout warns that PINGROOM_TOKEN keeps overriding it', () => {
+  const home = newHome();
+  seedCredential(home, { token: 'stored_tok' });
+  try {
+    const { stdout } = run(['logout'], { PINGROOM_HOME: home, PINGROOM_TOKEN: 'env_tok' });
+    assert.match(stdout, /PINGROOM_TOKEN is still set/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('help documents the credential store, the precedence, and the absence of a login command', () => {
+  const { stdout } = run(['--help']);
+  assert.match(stdout, /~\/\.pingroom\/credentials\.json/);
+  assert.match(stdout, /PINGROOM_HOME/);
+  assert.match(stdout, /explicit flag\s+>\s+env var\s+>\s+~\/\.pingroom\/config\.json\s+>\s+built-in default/);
+  assert.match(stdout, /There is no "login" command/);
+  assert.match(stdout, /^  config   /m);
+  assert.match(stdout, /^  logout   /m);
 });

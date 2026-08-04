@@ -30,5 +30,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://gitlab.com/pingroom/cli.git"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
   }
 }

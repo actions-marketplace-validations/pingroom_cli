@@ -3,7 +3,8 @@
 Send PingRoom pings — and ask a human a question and block for their answer —
 from CI, scripts, and agents. Delivered as push straight to your phone.
 
-Zero dependencies. Works anywhere Node ≥ 20 runs.
+One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
+anywhere Node ≥ 20 runs.
 
 ```bash
 npx @pingroom/cli ping -w "$PINGROOM_WEBHOOK_URL" -m "Deploy succeeded ✅"
@@ -11,8 +12,60 @@ npx @pingroom/cli ping -w "$PINGROOM_WEBHOOK_URL" -m "Deploy succeeded ✅"
 
 Commands: `ping` (send), `ask` (ask a human), `watch` (block on an existing
 question), `list`, `cancel`, `handoff` (hand a decision to a specific human),
-and `handoffs` (list open or recent Handoffs).
+`handoffs` (list open or recent Handoffs), `live` (lock-screen progress card),
+`hook` (Claude Code), `config`, and `logout`.
 Run `pingroom --help` for the full reference.
+
+## Connecting
+
+Run `pingroom` with no arguments. It prints a QR code — scan it with the PingRoom
+app and pick both the account and the room the agent delivers to — or take the
+emailed-code fallback.
+
+```
+$ pingroom
+  Not connected. How do you want to connect?
+    1) Scan a QR code with the PingRoom app
+    2) Email me a code
+  Choose [1]:
+
+  [QR]
+  Or open: https://pingroom.io/app/agents/pair?token=…
+  Waiting for approval… ✓ Connected as @agt_ab12cd34ef → #Project X
+```
+
+There is deliberately no `login` command: being unconnected is a state the tool
+resolves, not one you have to discover. Once connected, bare `pingroom` prints
+that status line followed by the usual help.
+
+The credential lands in `~/.pingroom/credentials.json` (mode `0600`, inside a
+`0700` directory). `PINGROOM_HOME` moves that directory; `pingroom logout`
+clears it.
+
+**CI is unaffected.** `PINGROOM_TOKEN` in the environment always outranks the
+stored credential, and a non-interactive shell never prompts and never draws a
+QR — a command that needs a credential and has none fails with exit `2` pointing
+at `PINGROOM_TOKEN`.
+
+### Local settings
+
+```bash
+pingroom config set default_room ab12cd     # fallback for --room
+pingroom config set api_url https://api.pingroom.io
+pingroom config get default_room
+pingroom config list
+pingroom config set api_url ""              # an empty value clears the key
+```
+
+Precedence, highest first:
+
+```
+explicit flag  >  env var  >  ~/.pingroom/config.json  >  built-in default
+```
+
+So `--room` beats `PINGROOM_ROOM` beats `default_room` (and, last of all, the
+room the credential was paired to); `--api` beats `PINGROOM_API_URL` beats
+`api_url`.
 
 ## Getting a webhook URL
 

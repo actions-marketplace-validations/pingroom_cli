@@ -1130,6 +1130,49 @@ test('hook notify events never fail the agent when the ping errors', async () =>
   }
 });
 
+// `hook` was the only command that attached a bearer without running its API
+// base through requireSafeUrl, so a config or env pointing at plain http shipped
+// `Authorization: Bearer …` in the clear with nothing on screen. It enforces the
+// same rule now, but by deferring rather than exiting — the hook must never
+// break the agent. The distinctive "cleartext" wording proves the refusal came
+// from the gate and not from a DNS failure downstream of it.
+test('hook refuses a cleartext API base instead of sending the token over it', async () => {
+  const env = { PINGROOM_TOKEN: 'tok', PINGROOM_ROOM: 'ab12cd' };
+  const cleartext = 'http://cleartext.invalid';
+
+  const notify = await runHook(['--api', cleartext], { hook_event_name: 'Stop' }, env);
+  assert.equal(notify.status, 0);
+  assert.match(notify.stderr, /hook skipped .*cleartext/);
+  assert.doesNotMatch(notify.stderr, /pinged/);
+
+  const gate = await runHook(
+    ['--api', cleartext],
+    { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } },
+    env,
+  );
+  assert.equal(gate.status, 0);
+  const decision = JSON.parse(gate.stdout).hookSpecificOutput;
+  assert.equal(decision.permissionDecision, 'ask');
+  assert.match(decision.permissionDecisionReason, /cleartext/);
+});
+
+test('hook still accepts an http loopback base, like every other command', async () => {
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/notifications': () => ({ status: 201, body: { id: 'n3' } }),
+  });
+  try {
+    assert.match(baseUrl, /^http:\/\/(127\.0\.0\.1|localhost)/);
+    const { status } = await runHook(['--api', baseUrl], { hook_event_name: 'Stop' }, {
+      PINGROOM_TOKEN: 'tok',
+      PINGROOM_ROOM: 'ab12cd',
+    });
+    assert.equal(status, 0);
+    assert.equal(received.length, 1);
+  } finally {
+    server.close();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // live — live-status streams
 // ---------------------------------------------------------------------------
@@ -1366,6 +1409,23 @@ test('exit 2: live rejects an unknown --category', () => {
   const { status, stderr } = run(['live', 'start', '-c', 'x', '--category', 'urgent']);
   assert.equal(status, 2);
   assert.match(stderr, /--category must be status, steps or alert/);
+});
+
+// --category was validated locally but --template was not, so a typo left the
+// CLI to 422 server-side — an outage-shaped failure for what is a usage error.
+test('exit 2: live rejects an unknown --template', () => {
+  const { status, stderr } = run(['live', 'start', '-c', 'x', '--template', 'progres']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--template must be one of: .*progress.*matchup/);
+});
+
+test('live accepts every documented template name', () => {
+  for (const name of ['status', 'steps', 'progress', 'metrics', 'countdown', 'question', 'matchup']) {
+    // No transport configured, so a valid template must fall through to the
+    // "provide a webhook or a token" usage error, never to a --template one.
+    const { stderr } = run(['live', 'start', '-c', 'x', '--template', name]);
+    assert.doesNotMatch(stderr, /--template must be one of/, `rejected valid template "${name}"`);
+  }
 });
 
 test('exit 2: live rejects --category on update', () => {

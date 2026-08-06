@@ -179,8 +179,12 @@ Connecting:
     credential  >  built-in default
   So --room beats PINGROOM_ROOM beats "config set default_room", and --api beats
   PINGROOM_API_URL beats "config set api_url" beats the host you paired against,
-  beats ${BUILTIN_API}. The credential layer is why a token minted by a
-  self-hosted server is never presented to ${BUILTIN_API}.
+  beats ${BUILTIN_API}. The credential's host is only a DEFAULT: it keeps a
+  token minted by a self-hosted server off ${BUILTIN_API} when nothing higher in
+  that list names a base. The token and the base resolve independently and are
+  never compared, so --api, PINGROOM_API_URL or "config set api_url" will send
+  the stored token to whatever host they name. Point them at the server that
+  issued the token, or pass --token too.
 
   Non-interactive shells (CI, pipes) never prompt and never draw a QR: set
   PINGROOM_TOKEN there instead.
@@ -338,6 +342,12 @@ function resolveToken(args) {
  * this layer the next command would present that bearer to api.pingroom.io —
  * leaking it to a host it was never issued for. resolveRoom() already consults
  * the credential last, so the two layerings now agree.
+ *
+ * It is a default, not a binding. This resolves independently of resolveToken()
+ * and the two are never compared, so anything outranking the credential (--api,
+ * PINGROOM_API_URL, config.api_url) still sends the stored token wherever it
+ * points — deliberate, so one credential can drive a staging host. The help
+ * text says so; don't restate it as a guarantee.
  */
 function resolveApiBase(args) {
   const raw = args.api
@@ -540,17 +550,30 @@ function parseHandoffArgs(argv) {
   return args;
 }
 
-// Refuse to send a bearer token or webhook secret over cleartext http. A
-// loopback host is allowed so local dev against http://localhost still works.
-function requireSafeUrl(kind, raw) {
+// True when a URL is safe to attach a bearer token or webhook secret to: https,
+// or http on loopback so local dev against http://localhost still works.
+// Split out of requireSafeUrl for the `hook` command, which must apply the same
+// rule but fails open (it defers instead of exiting — see hook()).
+function isSafeUrl(raw) {
   let u;
   try {
     u = new URL(raw);
   } catch {
-    fail(`${kind} is not a valid URL`, EXIT.USAGE);
+    return false;
   }
   const isLoopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
-  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && isLoopback)) {
+  return u.protocol === 'https:' || (u.protocol === 'http:' && isLoopback);
+}
+
+// Refuse to send a bearer token or webhook secret over cleartext http. A
+// loopback host is allowed so local dev against http://localhost still works.
+function requireSafeUrl(kind, raw) {
+  try {
+    new URL(raw);
+  } catch {
+    fail(`${kind} is not a valid URL`, EXIT.USAGE);
+  }
+  if (!isSafeUrl(raw)) {
     fail(`${kind} must use https (refusing to send credentials over cleartext)`, EXIT.USAGE);
   }
   return raw;
@@ -710,6 +733,11 @@ async function ping(args) {
 }
 
 // --- live status -----------------------------------------------------------
+
+// The templates the server accepts on `live start`. Mirrored here so a typo is
+// a local usage error instead of a 422 from the API. Keep in lockstep with the
+// --template line in HELP and with LIVE_ACTIVITY_TEMPLATES.md.
+const LIVE_TEMPLATES = ['status', 'steps', 'progress', 'metrics', 'countdown', 'question', 'matchup'];
 
 // Parser for `live`: a leading subcommand (start|update|end|get) plus the
 // live-status flags. Unknown flags fail like the other parsers.
@@ -896,7 +924,15 @@ async function live(args) {
   // Template, category and step labels are fixed when the stream is created;
   // sending them on an update is a no-op server-side, so only `start` takes them.
   if (sub === 'start') {
-    if (args.template) liveStatus.template = args.template;
+    // Validated locally for the same reason --category is: a typo'd name is a
+    // usage error, and letting it reach the server turns it into a 422 round
+    // trip that reads like an outage.
+    if (args.template) {
+      if (!LIVE_TEMPLATES.includes(args.template)) {
+        fail(`--template must be one of: ${LIVE_TEMPLATES.join(', ')}`, EXIT.USAGE);
+      }
+      liveStatus.template = args.template;
+    }
     // `alert` has no template equivalent and is the only way to start a stream
     // time-sensitive (breaking through Focus) without also demanding an ack.
     if (args.category) {
@@ -1684,6 +1720,22 @@ async function hook(args) {
   const token = resolveToken(args);
   const room = resolveRoom(args);
   const apiBase = resolveApiBase(args);
+
+  // Every other command that attaches a bearer gates its base through
+  // requireSafeUrl first; the hook was the one that didn't, so a config or env
+  // pointing at plain http shipped `Authorization: Bearer …` in the clear with
+  // nothing on screen. Same rule here — but enforced by deferring, not by
+  // exiting: the hook's whole contract is that it never blocks the agent, so a
+  // hard failure would trade a credential leak for a broken session.
+  if (!isSafeUrl(apiBase)) {
+    const why = `${apiBase} is not https — refusing to send credentials over cleartext`;
+    if (name === 'PreToolUse') {
+      emitPreToolUseDecision('ask', `PingRoom API base ${why}; deferring to local prompt`);
+    } else if (!args.quiet) {
+      process.stderr.write(`pingroom: hook skipped (API base ${why})\n`);
+    }
+    return EXIT.OK;
+  }
 
   if (name === 'PreToolUse') {
     return hookPreToolUse(event, { token, room, apiBase, args });

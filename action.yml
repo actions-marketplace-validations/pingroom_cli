@@ -121,7 +121,9 @@ runs:
         PR_WAIT: ${{ inputs.wait }}
       run: |
         set -o pipefail
-        CLI="npx --yes @pingroom/cli@0.6.1"
+        # Release gate: keep the Action on an npm-published version. Advance
+        # this independently only after the matching CLI package is public.
+        CLI="npx --yes @pingroom/cli@0.6.0"
 
         if [ "$PR_HANDOFF" = "true" ]; then
           args=(handoff -m "$PR_MESSAGE")

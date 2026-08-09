@@ -6,6 +6,11 @@ from CI, scripts, and agents. Delivered as push straight to your phone.
 One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
 anywhere Node ≥ 20 runs.
 
+> **Release status:** npm currently serves 0.6.0. The automatic verified-phone
+> activation flow and `pingroom activate` documented below are in the tested
+> 0.6.1 release candidate on `main`; the public GitHub Action remains pinned to
+> 0.6.0 until 0.6.1 is published and clean-install verified.
+
 ## Install and first run
 
 Install globally, then connect:
@@ -37,7 +42,8 @@ pingroom ping -m "Deploy succeeded ✅"
 Commands: `ping` (send), `ask` (ask a human), `watch` (block on an existing
 question), `list`, `cancel`, `handoff` (hand a decision to a specific human),
 `handoffs` (list open or recent Handoffs), `live` (lock-screen progress card),
-`hook` (Claude Code), `mcp` (client setup), `config`, and `logout`.
+`hook` (Claude Code), `mcp` (client setup), `activate` (retry the Agent Inbox
+test), `config`, and `logout`.
 Run `pingroom --help` for the full reference.
 
 ## Connecting
@@ -56,7 +62,37 @@ $ pingroom
   [QR]
   Or open: https://pingroom.io/app/agents/pair?token=…
   Waiting for approval… ✓ Connected as @agt_ab12cd34ef → #Project X
+  Sending a test question to PingRoom…
+  Answer “PingRoom connected. Can you answer this?” on your phone.
+✓ Test question answered (Yes). Agent Inbox is ready.
 ```
+
+After QR approval, the CLI saves the active credential first, then sends one
+idempotent onboarding Question and observes it through the Handoff wait API.
+Short network and server failures are retried, and `Retry-After` is honored for
+rate limits within the two-minute overall deadline. An answer alone is not
+reported as success: the terminal response must also carry the server's exact
+`activation_completed: true` stamp. On supporting server and mobile builds,
+that stamp means the native phone returned the opaque proof carried in the push
+before the human answer, and this CLI then observed the result. An answered
+response whose stamp is false or missing is incomplete and is not retried as if
+history could be rewritten. If the Question is still pending when the local
+deadline elapses, or activation cannot start, the CLI prints the recovery
+command and exits with the connection still saved and usable. A terminal test
+without the stamp requires a current PingRoom app and a fresh numbered attempt;
+run `pingroom activate` again with the saved connection.
+
+Resume an open idempotent check with the saved QR credential:
+
+```bash
+pingroom activate
+```
+
+An incomplete explicit retry exits `1`; it never deletes or replaces the saved
+credential. The command does not fall back to `PINGROOM_TOKEN`, an email-only
+credential, or a credential without `pingroom:handoffs:create` and a
+QR-selected delivery room. Email-code and other non-interactive credential
+flows do not run the phone-response loop automatically.
 
 There is deliberately no `login` command: being unconnected is a state the tool
 resolves, not one you have to discover. Once connected, bare `pingroom` prints

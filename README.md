@@ -6,21 +6,45 @@ from CI, scripts, and agents. Delivered as push straight to your phone.
 One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
 anywhere Node ≥ 20 runs.
 
+## Install and first run
+
+Install globally, then connect:
+
 ```bash
-npx @pingroom/cli ping -w "$PINGROOM_WEBHOOK_URL" -m "Deploy succeeded ✅"
+npm install --global @pingroom/cli
+pingroom
+```
+
+Or use it without a global install:
+
+```bash
+npx --yes @pingroom/cli
+```
+
+Either command starts the same connection prompt. QR pairing stores the selected
+account, credential, and delivery room in `~/.pingroom`; later commands reuse
+them, so a local invocation needs neither `PINGROOM_TOKEN` nor `PINGROOM_ROOM`.
+The email fallback stores the credential only. Setting
+`pingroom config set default_room <invite-code>` enables room-addressed commands,
+but private Agent Inbox and Handoff delivery require a connection approved with
+a delivery room. Use QR pairing for the complete flow.
+
+```bash
+pingroom ping -m "Deploy succeeded ✅"
+# or: npx --yes @pingroom/cli ping -m "Deploy succeeded ✅"
 ```
 
 Commands: `ping` (send), `ask` (ask a human), `watch` (block on an existing
 question), `list`, `cancel`, `handoff` (hand a decision to a specific human),
 `handoffs` (list open or recent Handoffs), `live` (lock-screen progress card),
-`hook` (Claude Code), `config`, and `logout`.
+`hook` (Claude Code), `mcp` (client setup), `config`, and `logout`.
 Run `pingroom --help` for the full reference.
 
 ## Connecting
 
-Run `pingroom` with no arguments. It prints a QR code — scan it with the PingRoom
-app and pick both the account and the room the agent delivers to — or take the
-emailed-code fallback.
+Run `pingroom` (global install) or `npx --yes @pingroom/cli` (no install) with no
+arguments. It prints a QR code — scan it with the PingRoom app and pick both the
+account and the room the agent delivers to — or take the emailed-code fallback.
 
 ```
 $ pingroom
@@ -66,6 +90,11 @@ explicit flag  >  env var  >  ~/.pingroom/config.json  >  built-in default
 So `--room` beats `PINGROOM_ROOM` beats `default_room` (and, last of all, the
 room the credential was paired to); `--api` beats `PINGROOM_API_URL` beats
 `api_url`.
+
+A stored paired credential is bound to the API origin that issued it. An API
+override can change the path on that origin, but the CLI refuses to send the
+stored bearer to a different origin. For an intentional custom-host override,
+provide that host's token explicitly with `--token` or `PINGROOM_TOKEN`.
 
 ## Getting a webhook URL
 
@@ -360,13 +389,19 @@ Print a ready-to-paste config:
 
 ```bash
 pingroom hook --print-config
+# no global install: npx --yes @pingroom/cli hook --print-config
 ```
 
-Then set your credentials and merge the printed `hooks` block into
-`~/.claude/settings.json`:
+If you have not connected yet, run `pingroom` (or `npx --yes @pingroom/cli`) and
+scan the QR first. The hook reads the stored credential and the room selected
+during pairing automatically. No environment variables are needed for a normal
+local setup; merge the printed `hooks` block into `~/.claude/settings.json`.
+
+Environment variables remain available for CI and other headless shells, and
+take precedence over the paired values:
 
 ```bash
-export PINGROOM_TOKEN="<your agent token>"   # a room the agent belongs to
+export PINGROOM_TOKEN="<your agent token>"
 export PINGROOM_ROOM="<room invite code>"
 ```
 
@@ -386,8 +421,23 @@ blocks the agent. Because the `PreToolUse` hook holds the tool call open while i
 waits for you, give it a generous `timeout` (the printed config uses 960s) and
 tune the approval-question expiry with `--ttl <seconds>` (default 900).
 
+## MCP client setup
+
+Print the canonical remote endpoint, a copy-ready Claude Code command, Cursor
+JSON, and the Claude Desktop custom-connector steps:
+
+```bash
+pingroom mcp
+# no global install: npx --yes @pingroom/cli mcp
+```
+
+`pingroom mcp add claude-code` prints the exact `claude mcp add` command but does
+not execute it or modify client configuration. After adding the server, use the
+client's MCP controls to authenticate in the browser; no PingRoom API key is
+pasted into its config.
+
 For a fully typed client, use [`@pingroom/sdk`](https://www.npmjs.com/package/@pingroom/sdk).
-See <https://pingroom.io/connect-mcp.md> to connect Cursor, Claude Desktop, or Claude Code.
+See <https://pingroom.io/connect-mcp.md> for the complete MCP and OAuth guide.
 
 ## License
 

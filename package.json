@@ -1,7 +1,7 @@
 {
   "name": "@pingroom/cli",
-  "version": "0.6.0",
-  "description": "Send PingRoom pings and ask humans blocking questions from CI, scripts, and agents.",
+  "version": "0.6.1",
+  "description": "Send PingRoom Pings and wait for human decisions from CI, scripts, and agents.",
   "type": "module",
   "bin": {
     "pingroom": "bin/pingroom.js"
@@ -29,7 +29,10 @@
   "homepage": "https://pingroom.io",
   "repository": {
     "type": "git",
-    "url": "git+https://gitlab.com/pingroom/cli.git"
+    "url": "git+https://github.com/pingroom/cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pingroom/cli/issues"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0"

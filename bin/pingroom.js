@@ -21,6 +21,7 @@
 //   handoffs List the agent's open handoffs or bounded recent history.
 //   live     Drive a live progress card (iOS Live Activity / Android live
 //            update) on the room members' lock screen: start / update / end.
+//   mcp      Print the canonical remote MCP endpoint and client setup snippets.
 //   config   Read/write ~/.pingroom/config.json (default_room, api_url).
 //   logout   Forget the credential in ~/.pingroom/credentials.json.
 //
@@ -38,9 +39,10 @@ import { join } from 'node:path';
 // Kept in lockstep with package.json / package-lock.json / action.yml (a test
 // asserts the GitHub Action pins this exact version). `hook --print-config`
 // emits an `npx @pingroom/cli@<VERSION>` command, so it must match too.
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 
 const BUILTIN_API = 'https://api.pingroom.io';
+const MCP_ENDPOINT = `${BUILTIN_API}/api/agent/mcp`;
 const DEFAULT_API = process.env.PINGROOM_API_URL || BUILTIN_API;
 
 const HELP = `pingroom — send a ping, or ask a human a question, from CI/scripts/agents
@@ -60,6 +62,8 @@ Commands:
   live     Drive a live progress card on the lock screen (Live Activity)
   hook     Claude Code hook: ping on Stop/Notification, and route tool
            permission prompts to a PingRoom question you answer from your phone
+  mcp      Print the remote MCP endpoint and setup for Claude Code, Cursor, and
+           Claude Desktop
   config   Read/write local settings (config list | get <key> | set <key> <val>)
   logout   Forget the stored credential
 
@@ -145,11 +149,16 @@ live <start|update|end|get> options (agent token, or a room webhook):
       --room <code>          Room invite code (used with --token)
   -w, --webhook <url>        Room webhook URL instead of a token
 
-hook options (agent token required; reads a Claude Code hook event on stdin):
-      --room <code>      Room invite code (or env PINGROOM_ROOM)
+hook options (reads a Claude Code event; defaults to stored credentials/config):
+      --room <code>      Room invite code (or env/config/paired room)
       --ttl <seconds>    Approval-question expiry for PreToolUse (default 900)
       --quiet            Suppress the informational stderr lines
       --print-config     Print a ready-to-paste ~/.claude/settings.json block
+
+mcp:
+  pingroom mcp                     Print the endpoint and client setup snippets
+  pingroom mcp add claude-code     Print the Claude Code setup command
+                                   (output-only; does not change client config)
 
 config options:
   pingroom config list              Print the stored settings
@@ -162,12 +171,22 @@ Shared:
       --api <url>        API base URL (default ${DEFAULT_API}; env PINGROOM_API_URL)
       --json             Print the raw JSON response
   -h, --help             Show this help
+  -v, --version          Show the CLI version
 
 Connecting:
-  Run "pingroom" with no arguments to connect. It prints a QR code you scan with
-  the PingRoom app — you pick the account and the delivery room there — or you
-  can choose the emailed-code fallback. There is no "login" command: being
-  unconnected is a state the tool resolves, not one you have to discover.
+  Install globally, then run with no arguments:
+    npm install --global @pingroom/cli
+    pingroom
+
+  Or connect without installing globally:
+    npx --yes @pingroom/cli
+
+  It prints a QR code you scan with the PingRoom app — you pick the account and
+  delivery room there. The emailed-code fallback stores no server-side delivery
+  room. "config set default_room" enables room-addressed commands, but private
+  Inbox/Handoff delivery requires QR pairing.
+  There is no "login" command: being unconnected is a state the tool resolves,
+  not one you have to discover.
 
   The credential is written to ~/.pingroom/credentials.json (mode 0600, in a
   0700 directory). PINGROOM_HOME overrides that directory. PINGROOM_TOKEN in the
@@ -179,12 +198,10 @@ Connecting:
     credential  >  built-in default
   So --room beats PINGROOM_ROOM beats "config set default_room", and --api beats
   PINGROOM_API_URL beats "config set api_url" beats the host you paired against,
-  beats ${BUILTIN_API}. The credential's host is only a DEFAULT: it keeps a
-  token minted by a self-hosted server off ${BUILTIN_API} when nothing higher in
-  that list names a base. The token and the base resolve independently and are
-  never compared, so --api, PINGROOM_API_URL or "config set api_url" will send
-  the stored token to whatever host they name. Point them at the server that
-  issued the token, or pass --token too.
+  beats ${BUILTIN_API}. A stored credential is bound to the origin it was paired
+  against: an API override may change the path on that origin, but a different
+  origin is refused before the token is sent. To target another origin
+  intentionally, provide that host's token with --token or PINGROOM_TOKEN.
 
   Non-interactive shells (CI, pipes) never prompt and never draw a QR: set
   PINGROOM_TOKEN there instead.
@@ -229,14 +246,21 @@ Examples:
   # ...or end it as a failure, which still delivers one completion alert:
   #   pingroom live end ... --failed -m "Rollback triggered"
 
-  # Connect Claude Code to your phone (prints the settings.json to paste):
+  # Connect Claude Code hooks to your paired credential (no env vars needed):
   pingroom hook --print-config
+
+  # Connect an MCP client through browser OAuth (no API key needed):
+  pingroom mcp
 
 Security:
   Prefer the env vars (PINGROOM_WEBHOOK_URL / PINGROOM_TOKEN) over passing
   secrets as --webhook / --token flags: argv is visible to other users via the
   process table (ps) and may be captured in shell history. URLs must use https
   (loopback http is allowed for local dev).
+
+  A paired credential is only sent to its recorded API origin. --api,
+  PINGROOM_API_URL and config.api_url cannot redirect that stored bearer to a
+  different origin; provide an explicit --token or PINGROOM_TOKEN to override.
 
 Exit codes: 0 on success (answered / acked), 1 on error (network/auth/5xx),
 2 on bad usage, 3 when a handoff or question expired, 4 when it was cancelled
@@ -343,11 +367,10 @@ function resolveToken(args) {
  * leaking it to a host it was never issued for. resolveRoom() already consults
  * the credential last, so the two layerings now agree.
  *
- * It is a default, not a binding. This resolves independently of resolveToken()
- * and the two are never compared, so anything outranking the credential (--api,
- * PINGROOM_API_URL, config.api_url) still sends the stored token wherever it
- * points — deliberate, so one credential can drive a staging host. The help
- * text says so; don't restate it as a guarantee.
+ * It is also an issuer boundary when resolveToken() falls through to the stored
+ * credential. Overrides may change the path on the same origin, but
+ * requireStoredCredentialOrigin() refuses a different origin unless the caller
+ * supplies an explicit --token or PINGROOM_TOKEN for that host.
  */
 function resolveApiBase(args) {
   const raw = args.api
@@ -356,6 +379,38 @@ function resolveApiBase(args) {
     || readStoredCredential()?.api_url
     || BUILTIN_API;
   return String(raw).replace(/\/$/, '');
+}
+
+/**
+ * A paired bearer belongs to the API origin that minted it. API settings still
+ * resolve independently so callers can select a path or an intentional custom
+ * host, but a stored token may only follow them within its recorded origin.
+ * Supplying --token / PINGROOM_TOKEN makes the token source explicit and opts
+ * out of this stored-credential binding.
+ */
+function storedCredentialOriginError(args, apiBase) {
+  if (args.token || process.env.PINGROOM_TOKEN) return null;
+
+  const credential = readStoredCredential();
+  if (!credential || typeof credential.api_url !== 'string' || credential.api_url === '') return null;
+
+  let credentialOrigin;
+  let targetOrigin;
+  try {
+    credentialOrigin = new URL(credential.api_url).origin;
+    targetOrigin = new URL(apiBase).origin;
+  } catch {
+    // URL validation owns malformed values. This guard only compares origins.
+    return null;
+  }
+
+  if (credentialOrigin === targetOrigin) return null;
+  return `stored credential is bound to ${credentialOrigin}; refusing to send it to ${targetOrigin}. Provide --token or PINGROOM_TOKEN for an intentional API origin override`;
+}
+
+function requireStoredCredentialOrigin(args, apiBase) {
+  const error = storedCredentialOriginError(args, apiBase);
+  if (error) fail(error, EXIT.USAGE);
 }
 
 /**
@@ -698,6 +753,7 @@ async function ping(args) {
     if (ackTimeout !== undefined) body.ack_timeout_seconds = ackTimeout;
     result = await httpJson('POST', webhook, { body });
   } else if (token) {
+    requireStoredCredentialOrigin(args, apiBase);
     if (!room) fail('--room is required when using --token (or set one with "pingroom config set default_room <code>")', EXIT.USAGE);
     if (ackTimeout !== undefined && (ackTimeout < 60 || ackTimeout > 86_400)) {
       fail('--ack-timeout must be between 60 and 86400 seconds for an agent room ping', EXIT.USAGE);
@@ -872,6 +928,7 @@ async function live(args) {
 
   if (sub === 'get') {
     if (!token) fail('live get requires an agent token (--token or PINGROOM_TOKEN)', EXIT.USAGE);
+    requireStoredCredentialOrigin(args, apiBase);
     if (!room) fail('--room is required', EXIT.USAGE);
     requireSafeUrl('--api', apiBase);
     const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(room)}/live/${encodeURIComponent(correlationId)}`;
@@ -971,6 +1028,7 @@ async function live(args) {
     requireSafeUrl('--webhook', webhook);
     result = await httpJson('POST', webhook, { body });
   } else if (token) {
+    requireStoredCredentialOrigin(args, apiBase);
     if (!room) fail('--room is required when using --token (or set one with "pingroom config set default_room <code>")', EXIT.USAGE);
     requireSafeUrl('--api', apiBase);
     const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(room)}/live`;
@@ -1008,6 +1066,7 @@ function agentContext(args, { needRoom = false } = {}) {
     );
   }
   const apiBase = resolveApiBase(args);
+  requireStoredCredentialOrigin(args, apiBase);
   requireSafeUrl('--api', apiBase);
   const room = resolveRoom(args);
   if (needRoom && !room) {
@@ -1562,7 +1621,7 @@ async function hookWaitForAnswer(id, { token, apiBase }) {
 
 async function hookPreToolUse(event, { token, room, apiBase, args }) {
   if (!token || !room) {
-    emitPreToolUseDecision('ask', 'PingRoom not configured (set PINGROOM_TOKEN and PINGROOM_ROOM)');
+    emitPreToolUseDecision('ask', 'PingRoom not configured (pair by QR, or configure both a token and room)');
     return EXIT.OK;
   }
 
@@ -1632,7 +1691,7 @@ async function hookPreToolUse(event, { token, room, apiBase, args }) {
 
 async function hookNotify(event, name, { token, room, apiBase, args }) {
   if (!token || !room) {
-    if (!args.quiet) process.stderr.write('pingroom: hook skipped (set PINGROOM_TOKEN and PINGROOM_ROOM)\n');
+    if (!args.quiet) process.stderr.write('pingroom: hook skipped (pair by QR, or configure both a token and room)\n');
     return EXIT.OK;
   }
 
@@ -1689,9 +1748,12 @@ function printHookConfig() {
   process.stdout.write(
 `# PingRoom × Claude Code — merge this into ~/.claude/settings.json
 #
-# 1. Set your credentials in the environment (e.g. in your shell profile):
-#      export PINGROOM_TOKEN="<your agent token>"
-#      export PINGROOM_ROOM="<room invite code>"
+# 1. Connect once and choose a delivery room when you scan the QR:
+#      npm install --global @pingroom/cli && pingroom
+#    Or, without a global install:
+#      npx --yes @pingroom/cli@${VERSION}
+#    The hook reads that stored credential and paired room automatically; you do
+#    not need to export PINGROOM_TOKEN or PINGROOM_ROOM for a local setup.
 #
 # 2. Merge the "hooks" block below into ~/.claude/settings.json.
 #      Stop / Notification  -> ping your phone.
@@ -1701,6 +1763,7 @@ function printHookConfig() {
 #
 # If PingRoom is unreachable the hook defers to the normal local prompt — it
 # never auto-approves and never blocks the agent.
+# PINGROOM_TOKEN / PINGROOM_ROOM remain supported for CI and headless shells.
 
 ${JSON.stringify(config, null, 2)}
 `);
@@ -1720,6 +1783,16 @@ async function hook(args) {
   const token = resolveToken(args);
   const room = resolveRoom(args);
   const apiBase = resolveApiBase(args);
+
+  const originError = storedCredentialOriginError(args, apiBase);
+  if (originError) {
+    if (name === 'PreToolUse') {
+      emitPreToolUseDecision('ask', `${originError}; deferring to local prompt`);
+    } else if (!args.quiet) {
+      process.stderr.write(`pingroom: hook skipped (${originError})\n`);
+    }
+    return EXIT.OK;
+  }
 
   // Every other command that attaches a bearer gates its base through
   // requireSafeUrl first; the hook was the one that didn't, so a config or env
@@ -1741,6 +1814,50 @@ async function hook(args) {
     return hookPreToolUse(event, { token, room, apiBase, args });
   }
   return hookNotify(event, name, { token, room, apiBase, args });
+}
+
+// --- MCP client setup ------------------------------------------------------
+
+function mcp(rest) {
+  const claudeCommand = `claude mcp add --transport http pingroom ${MCP_ENDPOINT}`;
+
+  if (rest.length === 0 || (rest.length === 1 && (rest[0] === '-h' || rest[0] === '--help'))) {
+    const config = {
+      mcpServers: {
+        pingroom: { url: MCP_ENDPOINT },
+      },
+    };
+    process.stdout.write(
+`PingRoom MCP endpoint:
+  ${MCP_ENDPOINT}
+
+Claude Code:
+  ${claudeCommand}
+
+Cursor JSON (~/.cursor/mcp.json):
+${JSON.stringify(config, null, 2)}
+
+Claude Desktop:
+  Customize > Connectors > Add custom connector
+  Name: PingRoom
+  URL:  ${MCP_ENDPOINT}
+
+After adding the server, use your client's MCP controls to authenticate in the
+browser. No API key is needed.
+This command only prints setup instructions and does not modify client config.
+`);
+    return EXIT.OK;
+  }
+
+  if (rest.length === 2 && rest[0] === 'add' && rest[1] === 'claude-code') {
+    process.stdout.write(
+`No client configuration was changed. Copy and run:
+  ${claudeCommand}
+`);
+    return EXIT.OK;
+  }
+
+  fail('usage: pingroom mcp [add claude-code]', EXIT.USAGE);
 }
 
 // --- connecting (pairing + email fallback) ---------------------------------
@@ -2069,7 +2186,8 @@ async function connectByEmail(apiBase, ask) {
       saveCredential(cred);
       process.stdout.write(`${connectedLine(cred)}\n`);
       if (!cred.room) {
-        process.stdout.write('  Pick a delivery room with: pingroom config set default_room <invite code>\n');
+        process.stdout.write('  For room commands: pingroom config set default_room <invite code>\n');
+        process.stdout.write('  For private Inbox/Handoff delivery, reconnect with QR pairing.\n');
       }
       return cred;
     }
@@ -2276,6 +2394,7 @@ const COMMANDS = {
   handoff: (rest) => handoff(parseHandoffArgs(rest)),
   handoffs: (rest) => listHandoffs(parseQArgs(rest)),
   hook: (rest) => hook(parseHookArgs(rest)),
+  mcp,
   live: (rest) => live(parseLiveArgs(rest)),
   config: (rest) => config(parseQArgs(rest)),
   logout: (rest) => logout(parseQArgs(rest)),
@@ -2291,6 +2410,11 @@ async function main() {
 
   if (command === '-h' || command === '--help' || command === 'help') {
     process.stdout.write(`${HELP}\n`);
+    process.exit(EXIT.OK);
+  }
+
+  if (command === '-v' || command === '--version') {
+    process.stdout.write(`${VERSION}\n`);
     process.exit(EXIT.OK);
   }
 

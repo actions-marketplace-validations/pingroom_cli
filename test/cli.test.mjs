@@ -43,14 +43,14 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.6\.0/);
+  assert.match(action, /@pingroom\/cli@0\.6\.1/);
 });
 
 test('package version matches the GitHub Action CLI pin', () => {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.6.0');
+  assert.equal(pkg.version, '0.6.1');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   assert.match(action, new RegExp(`@pingroom/cli@${pkg.version.replaceAll('.', '\\.')}`));
@@ -162,6 +162,38 @@ test('exit 0: "help" command prints help', () => {
   const { status, stdout } = run(['help']);
   assert.equal(status, 0);
   assert.match(stdout, /Usage:/);
+});
+
+test('exit 0: --version and -v print the package version', () => {
+  const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
+  for (const flag of ['--version', '-v']) {
+    const { status, stdout, stderr } = run([flag]);
+    assert.equal(status, 0);
+    assert.equal(stdout, `${pkg.version}\n`);
+    assert.equal(stderr, '');
+  }
+});
+
+test('mcp prints the canonical endpoint and copy-ready client setup', () => {
+  const { status, stdout, stderr } = run(['mcp']);
+  assert.equal(status, 0);
+  assert.equal(stderr, '');
+  assert.match(stdout, /https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
+  assert.match(stdout, /claude mcp add --transport http pingroom https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
+  assert.match(stdout, /"mcpServers"/);
+  assert.match(stdout, /"pingroom": \{/);
+  assert.match(stdout, /"url": "https:\/\/api\.pingroom\.io\/api\/agent\/mcp"/);
+  assert.match(stdout, /Claude Desktop:/);
+  assert.match(stdout, /Add custom connector/);
+  assert.match(stdout, /does not modify client config/);
+});
+
+test('mcp add claude-code remains safe and output-only', () => {
+  const { status, stdout, stderr } = run(['mcp', 'add', 'claude-code']);
+  assert.equal(status, 0);
+  assert.equal(stderr, '');
+  assert.match(stdout, /No client configuration was changed/);
+  assert.match(stdout, /claude mcp add --transport http pingroom https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
 });
 
 test('exit 0: ping -h prints help via the ping path', () => {
@@ -981,7 +1013,9 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.6\.0 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.6\.1 hook/);
+  assert.match(stdout, /stored credential and paired room automatically/);
+  assert.doesNotMatch(stdout, /^#\s+export PINGROOM_TOKEN/m);
 });
 
 test('hook Stop pings the room with the last assistant message', async () => {
@@ -1014,6 +1048,31 @@ test('hook Stop pings the room with the last assistant message', async () => {
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('hook uses the QR-paired credential and room without environment variables', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'pingroom-hook-home-'));
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/PAIRED42/notifications': () => ({ status: 201, body: { id: 'n1' } }),
+  });
+  writeFileSync(join(home, 'credentials.json'), `${JSON.stringify({
+    version: 1,
+    token: 'paired_token',
+    api_url: baseUrl,
+    room: { invite_code: 'PAIRED42', name: 'Paired room' },
+  })}\n`, { mode: 0o600 });
+
+  try {
+    const { status, stderr } = await runHook([], { hook_event_name: 'Stop' }, { PINGROOM_HOME: home });
+    assert.equal(status, 0);
+    assert.match(stderr, /pinged/);
+    assert.equal(received.length, 1);
+    assert.equal(received[0].path, '/api/agent/rooms/PAIRED42/notifications');
+    assert.equal(received[0].auth, 'Bearer paired_token');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -1170,6 +1229,41 @@ test('hook still accepts an http loopback base, like every other command', async
     assert.equal(received.length, 1);
   } finally {
     server.close();
+  }
+});
+
+test('hook fails open without sending when a stored credential is redirected to another origin', async () => {
+  const home = newHome();
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/notifications': () => ({ status: 201, body: { id: 'n-never' } }),
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q-never' } }),
+  });
+  seedCredential(home, {
+    token: 'paired_tok',
+    api_url: 'https://issuer.example.test',
+    room: { invite_code: 'ab12cd' },
+  });
+
+  try {
+    const env = { PINGROOM_HOME: home };
+    const notify = await runHook(['--api', baseUrl], { hook_event_name: 'Stop' }, env);
+    assert.equal(notify.status, 0);
+    assert.match(notify.stderr, /hook skipped .*stored credential is bound/);
+
+    const gate = await runHook(
+      ['--api', baseUrl],
+      { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } },
+      env,
+    );
+    assert.equal(gate.status, 0);
+    const decision = JSON.parse(gate.stdout).hookSpecificOutput;
+    assert.equal(decision.permissionDecision, 'ask');
+    assert.match(decision.permissionDecisionReason, /stored credential is bound/);
+    assert.match(decision.permissionDecisionReason, /--token or PINGROOM_TOKEN/);
+    assert.equal(received.length, 0, 'the stored bearer must never reach the override origin');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -1576,6 +1670,38 @@ test('--token outranks both the env var and the stored credential', async () => 
   }
 });
 
+test('ping and both live paths refuse to redirect a stored credential to another origin', async () => {
+  const home = newHome();
+  seedCredential(home, {
+    token: 'paired_tok',
+    api_url: 'https://issuer.example.test',
+    room: { invite_code: 'ABC123' },
+  });
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ABC123/notifications': () => ({ status: 201, body: { id: 'n-never' } }),
+    'POST /api/agent/rooms/ABC123/live': () => ({ status: 201, body: { success: true, state: 'running' } }),
+    'GET /api/agent/rooms/ABC123/live/stream-1': () => ({ status: 200, body: { state: 'running' } }),
+  });
+
+  try {
+    const commands = [
+      ['ping', '--api', baseUrl, '-m', 'hi'],
+      ['live', 'start', '--api', baseUrl, '-c', 'stream-1'],
+      ['live', 'get', '--api', baseUrl, '-c', 'stream-1'],
+    ];
+    for (const command of commands) {
+      const result = await runAsync(command, { PINGROOM_HOME: home });
+      assert.equal(result.status, 2, command.join(' '));
+      assert.match(result.stderr, /stored credential is bound/);
+      assert.match(result.stderr, /--token or PINGROOM_TOKEN/);
+    }
+    assert.equal(received.length, 0, 'no direct bearer path may reach the override origin');
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a corrupt credentials.json degrades to "not connected" instead of crashing', () => {
   const home = newHome();
   try {
@@ -1928,6 +2054,8 @@ test('help documents the credential store, the precedence, and the absence of a 
   assert.match(stdout, /There is no "login" command/);
   assert.match(stdout, /^  config   /m);
   assert.match(stdout, /^  logout   /m);
+  assert.match(stdout, /stored credential is bound to the origin it was paired\s+against/);
+  assert.match(stdout, /provide that host's token with --token or PINGROOM_TOKEN/);
 });
 
 // ---------------------------------------------------------------------------
@@ -2091,29 +2219,86 @@ test('pairing writes the api_url the credential was minted at', async () => {
   }
 });
 
-test('config api_url and the env var both outrank the credential api_url', async () => {
+test('config and env API overrides cannot redirect a stored credential to another origin', async () => {
   const home = newHome();
-  const wrong = await questionServer({
-    'POST /api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_wrong', state: 'pending' } }),
-  });
-  const right = await questionServer({
-    'POST /api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_right', state: 'pending' } }),
+  const issuer = await questionServer({});
+  const target = await questionServer({
+    'POST /api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_never', state: 'pending' } }),
   });
   try {
-    seedCredential(home, { token: 'paired_tok', room: { invite_code: 'ABC123' }, api_url: wrong.baseUrl });
+    seedCredential(home, { token: 'paired_tok', room: { invite_code: 'ABC123' }, api_url: issuer.baseUrl });
 
-    run(['config', 'set', 'api_url', right.baseUrl], { PINGROOM_HOME: home });
+    run(['config', 'set', 'api_url', target.baseUrl], { PINGROOM_HOME: home });
     const viaConfig = await runAsync(['ask', '-p', 'Go?'], { PINGROOM_HOME: home });
-    assert.equal(viaConfig.stdout.trim(), 'q_right');
+    assert.equal(viaConfig.status, 2);
+    assert.match(viaConfig.stderr, /stored credential is bound/);
 
     run(['config', 'set', 'api_url', ''], { PINGROOM_HOME: home });
-    const viaEnv = await runAsync(['ask', '-p', 'Go?'], { PINGROOM_HOME: home, PINGROOM_API_URL: right.baseUrl });
-    assert.equal(viaEnv.stdout.trim(), 'q_right');
+    const viaEnv = await runAsync(['ask', '-p', 'Go?'], { PINGROOM_HOME: home, PINGROOM_API_URL: target.baseUrl });
+    assert.equal(viaEnv.status, 2);
+    assert.match(viaEnv.stderr, /--token or PINGROOM_TOKEN/);
 
-    assert.equal(wrong.received.length, 0, 'the credential host must lose to config and env');
+    assert.equal(issuer.received.length, 0);
+    assert.equal(target.received.length, 0, 'the stored bearer must not reach config/env override origins');
   } finally {
-    wrong.server.close();
-    right.server.close();
+    issuer.server.close();
+    target.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an explicit flag or env token permits an intentional custom-origin override', async () => {
+  const home = newHome();
+  const target = await questionServer({
+    'POST /api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_override', state: 'pending' } }),
+  });
+  seedCredential(home, {
+    token: 'stored_tok',
+    room: { invite_code: 'ABC123' },
+    api_url: 'https://issuer.example.test',
+  });
+
+  try {
+    const viaFlag = await runAsync(
+      ['ask', '--api', target.baseUrl, '--token', 'flag_tok', '-p', 'Go?'],
+      { PINGROOM_HOME: home },
+    );
+    assert.equal(viaFlag.status, 0, viaFlag.stderr);
+
+    const viaEnv = await runAsync(['ask', '-p', 'Go?'], {
+      PINGROOM_HOME: home,
+      PINGROOM_API_URL: target.baseUrl,
+      PINGROOM_TOKEN: 'env_tok',
+    });
+    assert.equal(viaEnv.status, 0, viaEnv.stderr);
+    assert.deepEqual(target.received.map((request) => request.auth), ['Bearer flag_tok', 'Bearer env_tok']);
+  } finally {
+    target.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a same-origin API path override may use the stored credential', async () => {
+  const home = newHome();
+  const target = await questionServer({
+    'POST /proxy/api/agent/rooms/ABC123/questions': () => ({ status: 201, body: { id: 'q_same_origin', state: 'pending' } }),
+  });
+  seedCredential(home, {
+    token: 'paired_tok',
+    room: { invite_code: 'ABC123' },
+    api_url: `${target.baseUrl}/paired-path`,
+  });
+
+  try {
+    const result = await runAsync(
+      ['ask', '--api', `${target.baseUrl}/proxy`, '-p', 'Go?'],
+      { PINGROOM_HOME: home },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), 'q_same_origin');
+    assert.equal(target.received[0].auth, 'Bearer paired_tok');
+  } finally {
+    target.server.close();
     rmSync(home, { recursive: true, force: true });
   }
 });

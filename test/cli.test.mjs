@@ -3047,3 +3047,115 @@ test('the shipped binary does not advertise the TTY override', () => {
   const { stdout } = run(['--help']);
   assert.doesNotMatch(stdout, /FORCE_TTY|INTERNAL_TEST_TTY/);
 });
+
+// ---------------------------------------------------------------------------
+// ping --attach
+// ---------------------------------------------------------------------------
+
+test('--attach uploads each file as multipart and sends only the ids', async () => {
+  const uploads = [];
+  let pingBody = null;
+
+  const { server, baseUrl } = await startServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const raw = Buffer.concat(chunks);
+
+    if (req.url === '/api/agent/attachments') {
+      uploads.push({
+        contentType: req.headers['content-type'],
+        raw: raw.toString('latin1'),
+      });
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ attachment: { id: `att_${uploads.length}` } }));
+      return;
+    }
+
+    pingBody = JSON.parse(raw.toString('utf8'));
+    res.writeHead(201, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id: 'n1' }));
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-attach-'));
+  const notes = join(dir, 'notes.txt');
+  const brief = join(dir, 'brief.md');
+  writeFileSync(notes, 'private notes');
+  writeFileSync(brief, '# brief');
+
+  try {
+    const { status } = await runAsync([
+      'ping', '-m', 'report attached',
+      '--attach', notes,
+      '--attach', brief,
+      '--token', 'tok_abc', '--room', 'AB12', '--api', baseUrl,
+    ]);
+
+    assert.equal(status, 0);
+    assert.equal(uploads.length, 2);
+    // The runtime must own the boundary — a hand-set Content-Type breaks it.
+    assert.match(uploads[0].contentType, /^multipart\/form-data; boundary=/);
+    assert.match(uploads[0].raw, /filename="notes\.txt"/);
+    assert.match(uploads[0].raw, /private notes/);
+    assert.match(uploads[1].raw, /filename="brief\.md"/);
+
+    // Flag order is claim order, and no bytes ride the JSON ping body.
+    assert.deepEqual(pingBody.attachment_ids, ['att_1', 'att_2']);
+    assert.equal(pingBody.message, 'report attached');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    server.close();
+  }
+});
+
+test('--attach rejects a webhook ping, an unsupported type, and a missing file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-attach-'));
+  const zip = join(dir, 'payload.zip');
+  const notes = join(dir, 'notes.txt');
+  writeFileSync(zip, 'PK');
+  writeFileSync(notes, 'private notes');
+
+  try {
+    const webhook = run(
+      ['ping', '-m', 'hi', '--attach', notes, '-w', 'https://api.pingroom.io/api/webhook/abc'],
+    );
+    assert.equal(webhook.status, 2);
+    assert.match(webhook.stderr, /--attach requires an agent token/);
+
+    const badType = run(
+      ['ping', '-m', 'hi', '--attach', zip, '--token', 'tok_abc', '--room', 'AB12'],
+    );
+    assert.equal(badType.status, 2);
+    assert.match(badType.stderr, /only md, pdf, html, txt, jpg, jpeg, png/);
+
+    const missing = run(
+      ['ping', '-m', 'hi', '--attach', join(dir, 'nope.txt'), '--token', 'tok_abc', '--room', 'AB12'],
+    );
+    assert.equal(missing.status, 2);
+    assert.match(missing.stderr, /file not found/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--attach surfaces the Pro gate instead of a bare HTTP error', async () => {
+  const { server, baseUrl } = await startServer((req, res) => {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ code: 'pro_required', message: 'Ping attachments are a Pro feature.' }));
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-attach-'));
+  const notes = join(dir, 'notes.txt');
+  writeFileSync(notes, 'private notes');
+
+  try {
+    const { status, stderr } = await runAsync([
+      'ping', '-m', 'hi', '--attach', notes,
+      '--token', 'tok_abc', '--room', 'AB12', '--api', baseUrl,
+    ]);
+    assert.equal(status, 2);
+    assert.match(stderr, /Pro feature/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    server.close();
+  }
+});

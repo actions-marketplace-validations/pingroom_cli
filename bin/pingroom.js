@@ -78,6 +78,8 @@ ping options:
       --button-label <t> Link button text (<= 26 chars; requires --url)
       --require-ack      Keep the ping open until an eligible recipient acknowledges it
       --ack-timeout <s>  Ack deadline in seconds (requires --require-ack)
+      --attach <path>    Attach a file (md/pdf/html/txt/jpg/jpeg/png, <= 20 MiB);
+                         repeat for up to 10. Requires --token and a Pro account
   -w, --webhook <url>    Room webhook URL (or env PINGROOM_WEBHOOK_URL)
       --token <token>    Agent access token (or env PINGROOM_TOKEN)
       --room <code>      Room invite code (used with --token)
@@ -479,6 +481,7 @@ function parseArgs(argv) {
     '--button-label': 'button_label',
     '--require-ack': 'require_ack',
     '--ack-timeout': 'ack_timeout',
+    '--attach': 'attach',
     '--token': 'token',
     '--room': 'room',
     '--api': 'api',
@@ -486,6 +489,7 @@ function parseArgs(argv) {
     '-h': 'help', '--help': 'help',
   };
   const booleans = new Set(['require_ack', 'json', 'help']);
+  const repeatable = new Set(['attach']);
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -501,7 +505,8 @@ function parseArgs(argv) {
       if (value === undefined) {
         fail(`option ${token} needs a value`, EXIT.USAGE);
       }
-      args[key] = value;
+      if (repeatable.has(key)) (args[key] ||= []).push(value);
+      else args[key] = value;
     } else if (token.startsWith('-')) {
       fail(`Unknown option: ${token}`, EXIT.USAGE);
     } else {
@@ -693,6 +698,90 @@ async function httpJson(method, url, { body, headers = {}, soft = false, signal 
   return { res, text, json };
 }
 
+// The extensions the attachment endpoint accepts. Mirrored here so a typo is a
+// local usage error instead of a 422 after the bytes have already been sent.
+// Keep in lockstep with laravel config/attachments.php `allowed_extensions`.
+const ATTACHMENT_EXTENSIONS = ['md', 'pdf', 'html', 'txt', 'jpg', 'jpeg', 'png'];
+const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+const ATTACHMENT_MAX_COUNT = 10;
+const ATTACHMENT_MIME = {
+  md: 'text/markdown',
+  pdf: 'application/pdf',
+  html: 'text/html',
+  txt: 'text/plain',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+};
+
+/**
+ * Upload each --attach path and return the ids in flag order. Bytes go up as
+ * multipart; only the resulting ids ride the ping body. An id we never manage
+ * to attach expires server-side after 24h, so a mid-run failure leaks nothing
+ * permanent.
+ */
+async function uploadAttachments(paths, apiBase, token) {
+  if (paths.length > ATTACHMENT_MAX_COUNT) {
+    fail(`--attach accepts at most ${ATTACHMENT_MAX_COUNT} files`, EXIT.USAGE);
+  }
+
+  const { readFile, stat } = await import('node:fs/promises');
+  const { basename, extname } = await import('node:path');
+  const ids = [];
+
+  for (const path of paths) {
+    const name = basename(path);
+    const ext = extname(name).slice(1).toLowerCase();
+    if (!ATTACHMENT_EXTENSIONS.includes(ext)) {
+      fail(`--attach ${name}: only ${ATTACHMENT_EXTENSIONS.join(', ')} files are supported`, EXIT.USAGE);
+    }
+
+    let info;
+    try {
+      info = await stat(path);
+    } catch {
+      fail(`--attach ${path}: file not found`, EXIT.USAGE);
+    }
+    if (!info.isFile()) fail(`--attach ${path}: not a file`, EXIT.USAGE);
+    if (info.size < 1) fail(`--attach ${name}: file is empty`, EXIT.USAGE);
+    if (info.size > ATTACHMENT_MAX_BYTES) {
+      fail(`--attach ${name}: file exceeds the 20 MiB limit`, EXIT.USAGE);
+    }
+
+    const body = new FormData();
+    body.append('file', new Blob([await readFile(path)], { type: ATTACHMENT_MIME[ext] }), name);
+
+    let res;
+    try {
+      // Not httpJson: that helper JSON-encodes the body and would strip the
+      // multipart boundary the runtime generates for us.
+      res = await fetch(`${apiBase}/api/agent/attachments`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+        body,
+      });
+    } catch (err) {
+      fail(`network error uploading ${name}: ${err.message}`);
+    }
+
+    const text = await res.text().catch(() => '');
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON response */ }
+
+    if (res.status === 402) {
+      fail(`--attach ${name}: ping attachments are a Pro feature`, EXIT.USAGE);
+    }
+    if (!res.ok || !json?.attachment?.id) {
+      const detail = json?.message || json?.error || `HTTP ${res.status}`;
+      fail(`upload failed for ${name}: ${detail}`);
+    }
+
+    ids.push(json.attachment.id);
+  }
+
+  return ids;
+}
+
 async function ping(args) {
   if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
 
@@ -751,6 +840,13 @@ async function ping(args) {
 
   let result;
 
+  // Attachments exist only on the agent-token path: an incoming webhook has no
+  // uploader identity to bind private files to, so the API takes no ids there.
+  const attachPaths = args.attach ?? [];
+  if (attachPaths.length && (webhook || !token)) {
+    fail('--attach requires an agent token (--token / PINGROOM_TOKEN), not a webhook ping', EXIT.USAGE);
+  }
+
   if (webhook) {
     if (ackTimeout !== undefined && (ackTimeout < 1 || ackTimeout > 86_400)) {
       fail('--ack-timeout must be between 1 and 86400 seconds for a webhook ping', EXIT.USAGE);
@@ -777,6 +873,9 @@ async function ping(args) {
     if (data) body.data = data;
     if (args.require_ack) body.requires_ack = true;
     if (ackTimeout !== undefined) body.ack_timeout_seconds = ackTimeout;
+    if (attachPaths.length) {
+      body.attachment_ids = await uploadAttachments(attachPaths, apiBase, token);
+    }
     result = await httpJson('POST', url, { body, headers: { Authorization: `Bearer ${token}` } });
   } else {
     fail('provide a webhook (--webhook / PINGROOM_WEBHOOK_URL) or an agent token (--token / PINGROOM_TOKEN, or run "pingroom" to connect)', EXIT.USAGE);

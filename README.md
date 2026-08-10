@@ -150,6 +150,7 @@ pingroom ping [options]
       --button-label <t> Link button text (<= 26 chars; requires --url)
       --require-ack      Keep the ping open until an eligible recipient acknowledges it
       --ack-timeout <s>  Ack deadline in seconds (requires --require-ack)
+      --attach <path>    Attach a file; repeat for up to 10 (requires --token)
   -w, --webhook <url>    Room webhook URL (or env PINGROOM_WEBHOOK_URL)
       --token <token>    Agent access token (or env PINGROOM_TOKEN)
       --room <code>      Room invite code (used with --token)
@@ -179,6 +180,21 @@ pingroom ping -w "$PINGROOM_WEBHOOK_URL" -m "Build 512 ready" \
 ```
 
 The URL must be absolute http(s) (≤ 2048 chars); the label caps at 26 chars.
+
+To send the file itself rather than a link to it, use `--attach`. Each file is
+uploaded separately and only the resulting ids ride the ping; recipients open
+them from the ping, authenticated:
+
+```bash
+pingroom ping --token "$PINGROOM_TOKEN" --room AB12 -m "Nightly report" \
+  --attach ./report.pdf --attach ./summary.md
+```
+
+Accepted types are `md`, `pdf`, `html`, `txt`, `jpg`, `jpeg`, `png`, up to
+20 MiB each and 10 per ping. `--attach` needs an agent token — a webhook ping
+has no uploader identity to bind private files to — and the bound account must
+hold Pro (otherwise the upload fails with `pro_required`). An upload that never
+reaches a ping expires by itself after 24 hours.
 
 Exit codes: `0` success · `1` delivery failed · `2` bad usage. So CI fails loudly if a
 ping doesn't land.

@@ -78,8 +78,8 @@ ping options:
       --button-label <t> Link button text (<= 26 chars; requires --url)
       --require-ack      Keep the ping open until an eligible recipient acknowledges it
       --ack-timeout <s>  Ack deadline in seconds (requires --require-ack)
-      --attach <path>    Attach a file (md/pdf/html/txt/jpg/jpeg/png, <= 20 MiB);
-                         repeat for up to 10. Requires --token and a Pro account
+      --attach <path>    Attach a file (md/pdf/html/txt/jpg/jpeg/png, <= 5 MiB);
+                         repeat for up to 4. Requires --token and a Pro account
   -w, --webhook <url>    Room webhook URL (or env PINGROOM_WEBHOOK_URL)
       --token <token>    Agent access token (or env PINGROOM_TOKEN)
       --room <code>      Room invite code (used with --token)
@@ -702,8 +702,8 @@ async function httpJson(method, url, { body, headers = {}, soft = false, signal 
 // local usage error instead of a 422 after the bytes have already been sent.
 // Keep in lockstep with laravel config/attachments.php `allowed_extensions`.
 const ATTACHMENT_EXTENSIONS = ['md', 'pdf', 'html', 'txt', 'jpg', 'jpeg', 'png'];
-const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
-const ATTACHMENT_MAX_COUNT = 10;
+const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+const ATTACHMENT_MAX_COUNT = 4;
 const ATTACHMENT_MIME = {
   md: 'text/markdown',
   pdf: 'application/pdf',
@@ -745,7 +745,7 @@ async function uploadAttachments(paths, apiBase, token) {
     if (!info.isFile()) fail(`--attach ${path}: not a file`, EXIT.USAGE);
     if (info.size < 1) fail(`--attach ${name}: file is empty`, EXIT.USAGE);
     if (info.size > ATTACHMENT_MAX_BYTES) {
-      fail(`--attach ${name}: file exceeds the 20 MiB limit`, EXIT.USAGE);
+      fail(`--attach ${name}: file exceeds the 5 MiB limit`, EXIT.USAGE);
     }
 
     const body = new FormData();

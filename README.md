@@ -150,7 +150,7 @@ pingroom ping [options]
       --button-label <t> Link button text (<= 26 chars; requires --url)
       --require-ack      Keep the ping open until an eligible recipient acknowledges it
       --ack-timeout <s>  Ack deadline in seconds (requires --require-ack)
-      --attach <path>    Attach a file; repeat for up to 10 (requires --token)
+      --attach <path>    Attach a file; repeat for up to 4 (requires --token)
   -w, --webhook <url>    Room webhook URL (or env PINGROOM_WEBHOOK_URL)
       --token <token>    Agent access token (or env PINGROOM_TOKEN)
       --room <code>      Room invite code (used with --token)
@@ -191,7 +191,7 @@ pingroom ping --token "$PINGROOM_TOKEN" --room AB12 -m "Nightly report" \
 ```
 
 Accepted types are `md`, `pdf`, `html`, `txt`, `jpg`, `jpeg`, `png`, up to
-20 MiB each and 10 per ping. `--attach` needs an agent token — a webhook ping
+5 MiB each and at most 4 per Ping. `--attach` needs an agent token — a webhook ping
 has no uploader identity to bind private files to — and the bound account must
 hold Pro (otherwise the upload fails with `pro_required`). An upload that never
 reaches a ping expires by itself after 24 hours.

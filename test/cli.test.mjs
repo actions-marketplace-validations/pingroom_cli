@@ -3052,6 +3052,13 @@ test('the shipped binary does not advertise the TTY override', () => {
 // ping --attach
 // ---------------------------------------------------------------------------
 
+test('help advertises the attachment type, size, and count contract', () => {
+  const { status, stdout } = run(['--help']);
+  assert.equal(status, 0);
+  assert.match(stdout, /md\/pdf\/html\/txt\/jpg\/jpeg\/png, <= 5 MiB/);
+  assert.match(stdout, /repeat for up to 4/);
+});
+
 test('--attach uploads each file as multipart and sends only the ids', async () => {
   const uploads = [];
   let pingBody = null;
@@ -3079,31 +3086,66 @@ test('--attach uploads each file as multipart and sends only the ids', async () 
   const dir = mkdtempSync(join(tmpdir(), 'pingroom-attach-'));
   const notes = join(dir, 'notes.txt');
   const brief = join(dir, 'brief.md');
+  const page = join(dir, 'page.html');
+  const maxSize = join(dir, 'max-size.txt');
   writeFileSync(notes, 'private notes');
   writeFileSync(brief, '# brief');
+  writeFileSync(page, '<p>status</p>');
+  writeFileSync(maxSize, Buffer.alloc(5 * 1024 * 1024, 65));
 
   try {
     const { status } = await runAsync([
       'ping', '-m', 'report attached',
       '--attach', notes,
       '--attach', brief,
+      '--attach', page,
+      '--attach', maxSize,
       '--token', 'tok_abc', '--room', 'AB12', '--api', baseUrl,
     ]);
 
     assert.equal(status, 0);
-    assert.equal(uploads.length, 2);
+    assert.equal(uploads.length, 4);
     // The runtime must own the boundary — a hand-set Content-Type breaks it.
     assert.match(uploads[0].contentType, /^multipart\/form-data; boundary=/);
     assert.match(uploads[0].raw, /filename="notes\.txt"/);
     assert.match(uploads[0].raw, /private notes/);
     assert.match(uploads[1].raw, /filename="brief\.md"/);
+    assert.match(uploads[2].raw, /filename="page\.html"/);
+    assert.match(uploads[3].raw, /filename="max-size\.txt"/);
 
     // Flag order is claim order, and no bytes ride the JSON ping body.
-    assert.deepEqual(pingBody.attachment_ids, ['att_1', 'att_2']);
+    assert.deepEqual(pingBody.attachment_ids, ['att_1', 'att_2', 'att_3', 'att_4']);
     assert.equal(pingBody.message, 'report attached');
   } finally {
     rmSync(dir, { recursive: true, force: true });
     server.close();
+  }
+});
+
+test('--attach enforces the four-file and 5 MiB limits before uploading', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-attach-limits-'));
+  const notes = join(dir, 'notes.txt');
+  const oversized = join(dir, 'oversized.txt');
+  writeFileSync(notes, 'private notes');
+  writeFileSync(oversized, Buffer.alloc(5 * 1024 * 1024 + 1, 65));
+
+  try {
+    const tooManyArgs = ['ping', '-m', 'hi'];
+    for (let i = 0; i < 5; i++) tooManyArgs.push('--attach', notes);
+    tooManyArgs.push('--token', 'tok_abc', '--room', 'AB12', '--api', 'http://127.0.0.1:1');
+
+    const tooMany = run(tooManyArgs);
+    assert.equal(tooMany.status, 2);
+    assert.match(tooMany.stderr, /--attach accepts at most 4 files/);
+
+    const tooLarge = run([
+      'ping', '-m', 'hi', '--attach', oversized,
+      '--token', 'tok_abc', '--room', 'AB12', '--api', 'http://127.0.0.1:1',
+    ]);
+    assert.equal(tooLarge.status, 2);
+    assert.match(tooLarge.stderr, /file exceeds the 5 MiB limit/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

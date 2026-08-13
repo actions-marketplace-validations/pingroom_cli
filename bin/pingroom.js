@@ -40,7 +40,7 @@ import { join } from 'node:path';
 // Kept in lockstep with package.json / package-lock.json. The GitHub Action is
 // pinned independently to the latest version already published on npm; a test
 // makes that release gate explicit. `hook --print-config` emits this candidate.
-const VERSION = '0.6.1';
+const VERSION = '0.6.2';
 
 const BUILTIN_API = 'https://api.pingroom.io';
 const MCP_ENDPOINT = `${BUILTIN_API}/api/agent/mcp`;

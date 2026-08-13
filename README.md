@@ -6,10 +6,10 @@ from CI, scripts, and agents. Delivered as push straight to your phone.
 One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
 anywhere Node ≥ 20 runs.
 
-> **Release status:** npm currently serves 0.6.0. The automatic verified-phone
-> activation flow and `pingroom activate` documented below are in the tested
-> 0.6.1 release candidate on `main`; the public GitHub Action remains pinned to
-> 0.6.0 until 0.6.1 is published and clean-install verified.
+> **Release status:** npm currently serves 0.6.1. The corrected attachment
+> limits are in the tested 0.6.2 release candidate on `main`; the public GitHub
+> Action remains pinned to 0.6.1 until 0.6.2 is published and clean-install
+> verified.
 
 ## Install and first run
 

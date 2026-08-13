@@ -50,12 +50,11 @@ test('source versions align while the GitHub Action stays on the published relea
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.6.1');
+  assert.equal(pkg.version, '0.6.2');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   // The Action must pin a concrete version, never a range or `latest`. 0.6.1 is
-  // published, so the pin has caught up with package.json; when the next version
-  // is cut here, this pin stays behind until that version is on npm.
+  // published, so the Action stays there until this release candidate is on npm.
   const pinned = action.match(/@pingroom\/cli@(\d+\.\d+\.\d+)/)?.[1];
   assert.equal(pinned, '0.6.1');
 });
@@ -1018,7 +1017,7 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.6\.1 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.6\.2 hook/);
   assert.match(stdout, /stored credential and paired room automatically/);
   assert.doesNotMatch(stdout, /^#\s+export PINGROOM_TOKEN/m);
 });

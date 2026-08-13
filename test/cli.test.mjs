@@ -43,7 +43,7 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.6\.1/);
+  assert.match(action, /@pingroom\/cli@0\.6\.2/);
 });
 
 test('source versions align while the GitHub Action stays on the published release', () => {
@@ -53,10 +53,10 @@ test('source versions align while the GitHub Action stays on the published relea
   assert.equal(pkg.version, '0.6.2');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
-  // The Action must pin a concrete version, never a range or `latest`. 0.6.1 is
-  // published, so the Action stays there until this release candidate is on npm.
+  // The Action must pin the concrete, clean-install-verified npm release, never
+  // a range or `latest`.
   const pinned = action.match(/@pingroom\/cli@(\d+\.\d+\.\d+)/)?.[1];
-  assert.equal(pinned, '0.6.1');
+  assert.equal(pinned, '0.6.2');
 });
 
 /**

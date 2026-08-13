@@ -6,10 +6,9 @@ from CI, scripts, and agents. Delivered as push straight to your phone.
 One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
 anywhere Node ≥ 20 runs.
 
-> **Release status:** npm currently serves 0.6.1. The corrected attachment
-> limits are in the tested 0.6.2 release candidate on `main`; the public GitHub
-> Action remains pinned to 0.6.1 until 0.6.2 is published and clean-install
-> verified.
+> **Release status:** npm serves 0.6.2, including the corrected attachment
+> limits. The published package and public GitHub Action are aligned and have
+> been clean-install verified.
 
 ## Install and first run
 

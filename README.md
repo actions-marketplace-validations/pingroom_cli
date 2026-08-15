@@ -6,9 +6,9 @@ from CI, scripts, and agents. Delivered as push straight to your phone.
 One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
 anywhere Node ≥ 20 runs.
 
-> **Release status:** 0.7.1 is prepared for publish — the room grant, the
+> **Release status:** 0.7.2 is prepared for publish — the room grant, the
 > `attachments:write` scope `--attach` always needed, and actionable text on the
-> refusals you can fix. The GitHub Action pins 0.7.1, so publish before relying
+> refusals you can fix. The GitHub Action pins 0.7.2, so publish before relying
 > on it.
 
 ## Install and first run

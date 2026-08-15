@@ -43,20 +43,20 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.7\.1/);
+  assert.match(action, /@pingroom\/cli@0\.7\.2/);
 });
 
 test('source versions align while the GitHub Action stays on the published release', () => {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.7.1');
+  assert.equal(pkg.version, '0.7.2');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   // The Action must pin the concrete, clean-install-verified npm release, never
   // a range or `latest`.
   const pinned = action.match(/@pingroom\/cli@(\d+\.\d+\.\d+)/)?.[1];
-  assert.equal(pinned, '0.7.1');
+  assert.equal(pinned, '0.7.2');
 });
 
 /**
@@ -200,11 +200,48 @@ test('mcp add claude-code remains safe and output-only', () => {
   assert.match(stdout, /claude mcp add --transport http pingroom https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
 });
 
-test('exit 0: ping -h prints help via the ping path', () => {
-  // `ping -h` routes through parseArgs -> args.help -> ping() returns 0.
+test('exit 0: ping -h prints the ping-focused help, not the full reference', () => {
+  // `ping -h` routes through parseArgs -> args.help -> ping() returns 0, and
+  // prints only the ping section plus the shared flags footer.
   const { status, stdout } = run(['ping', '-h']);
   assert.equal(status, 0);
-  assert.match(stdout, /pingroom — send a ping/);
+  assert.match(stdout, /^ping options:/);
+  assert.match(stdout, /-m, --message <text>/);
+  assert.match(stdout, /Shared:/);
+  assert.doesNotMatch(stdout, /pingroom — send a ping/);
+  assert.doesNotMatch(stdout, /ask options/);
+  assert.doesNotMatch(stdout, /Exit codes: 0 on success/);
+});
+
+test('exit 0: ask --help prints the ask section plus the shared flags', () => {
+  const { status, stdout } = run(['ask', '--help']);
+  assert.equal(status, 0);
+  assert.match(stdout, /^ask options \(agent token required\):/);
+  assert.match(stdout, /-p, --prompt <text>/);
+  assert.match(stdout, /--token <token>/);
+  assert.doesNotMatch(stdout, /ping options:/);
+  assert.doesNotMatch(stdout, /Connecting:/);
+});
+
+test('exit 0: live --help prints the live section (previously exit 2)', () => {
+  // Before per-command help, `live -h` failed with "live needs a subcommand"
+  // and `live start -h` silently ignored the flag.
+  for (const argv of [['live', '--help'], ['live', '-h'], ['live', 'start', '-h']]) {
+    const { status, stdout, stderr } = run(argv);
+    assert.equal(status, 0, stderr);
+    assert.match(stdout, /^live <start\|update\|end\|get> options/);
+    assert.doesNotMatch(stdout, /hook options/);
+  }
+});
+
+test('exit 0: logout --help prints its focused help without flags it rejects', () => {
+  const { status, stdout } = run(['logout', '--help']);
+  assert.equal(status, 0);
+  assert.match(stdout, /^logout:/);
+  assert.match(stdout, /-h, --help/);
+  // logout rejects --token/--api/--json, so its help must not advertise them.
+  assert.doesNotMatch(stdout, /--token/);
+  assert.doesNotMatch(stdout, /--json/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1054,7 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.7\.1 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.7\.2 hook/);
   assert.match(stdout, /stored credential and paired room automatically/);
   assert.doesNotMatch(stdout, /^#\s+export PINGROOM_TOKEN/m);
 });
@@ -3016,6 +3053,33 @@ test('inherited Object properties in flag position are not treated as options', 
   } finally {
     server.close();
   }
+});
+
+test('config, logout, and handoffs reject flags they never read', () => {
+  // These three shared parseQArgs, so `logout --wait --prompt x` parsed fine
+  // and the flags were silently ignored — inconsistent with the strict
+  // unknown-flag rejection every other command applies.
+  const cases = [
+    ['config', 'list', '--wait'],
+    ['config', 'set', 'default_room', 'ab12cd', '--prompt', 'x'],
+    ['logout', '--wait'],
+    ['logout', '--prompt', 'x'],
+    ['handoffs', '--prompt', 'x'],
+    ['handoffs', '--wait'],
+  ];
+  for (const argv of cases) {
+    const { status, stderr } = run(argv);
+    assert.equal(status, 2, `${argv.join(' ')} should be a usage error`);
+    assert.match(stderr, /Unknown option: --(wait|prompt)/);
+  }
+});
+
+test('handoffs still accepts its own flags after the strict table', () => {
+  // --state validation fires after parsing, so reaching its message proves
+  // --state/--token parsed; --json and --api are covered by the API tests.
+  const { status, stderr } = run(['handoffs', '--token', 'tok', '--state', 'answered']);
+  assert.equal(status, 2);
+  assert.match(stderr, /--state must be 'open' or 'all'/);
 });
 
 test('live rejects an empty --data the same way ping does', () => {

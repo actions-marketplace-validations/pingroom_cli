@@ -41,13 +41,17 @@ import { join } from 'node:path';
 // Kept in lockstep with package.json / package-lock.json. The GitHub Action is
 // pinned independently to the latest version already published on npm; a test
 // makes that release gate explicit. `hook --print-config` emits this candidate.
-const VERSION = '0.7.1';
+const VERSION = '0.7.2';
 
 const BUILTIN_API = 'https://api.pingroom.io';
 const MCP_ENDPOINT = `${BUILTIN_API}/api/agent/mcp`;
 const DEFAULT_API = process.env.PINGROOM_API_URL || BUILTIN_API;
 
-const HELP = `pingroom — send a ping, or ask a human a question, from CI/scripts/agents
+// The help text lives as one section per command plus intro/shared/tail, so
+// `pingroom <command> --help` can print a focused excerpt (see commandHelp).
+// The full HELP below joins them in the historical order — `pingroom --help`
+// output is byte-identical to the pre-split single blob.
+const HELP_INTRO = `pingroom — send a ping, or ask a human a question, from CI/scripts/agents
 
 Usage:
   pingroom <command> [options]
@@ -69,9 +73,9 @@ Commands:
            Claude Desktop
   activate Retry Agent Inbox activation with the saved QR-paired credential
   config   Read/write local settings (config list | get <key> | set <key> <val>)
-  logout   Forget the stored credential
+  logout   Forget the stored credential`;
 
-ping options:
+const HELP_PING = `ping options:
   -m, --message <text>   Ping body text (required)
   -t, --title <text>     Ping title (<= 40 chars)
   -a, --action <1-4>     Quick-action slot to attribute the ping to
@@ -84,9 +88,9 @@ ping options:
                          repeat for up to 4. Requires --token and a Pro account
   -w, --webhook <url>    Room webhook URL (or env PINGROOM_WEBHOOK_URL)
       --token <token>    Agent access token (or env PINGROOM_TOKEN)
-      --room <code>      Room invite code (used with --token)
+      --room <code>      Room invite code (used with --token)`;
 
-ask options (agent token required):
+const HELP_ASK = `ask options (agent token required):
   -p, --prompt <text>    The question a human reads (required)
   -o, --option <v:label[:style]>
                          An answer option (style: primary|danger|default);
@@ -102,12 +106,12 @@ ask options (agent token required):
   -d, --data <json>      Structured data object echoed back on the answer
       --correlation-id <id>  Opaque id echoed on every read of this question
       --reply-to <id>    Id of the ping this question replies to
-      --room <code>      Room invite code (required for ask)
+      --room <code>      Room invite code (required for ask)`;
 
-list options:
-      --state <s>        pending | answered | expired | cancelled | all
+const HELP_LIST = `list options:
+      --state <s>        pending | answered | expired | cancelled | all`;
 
-handoff options (agent token required; consent scope pingroom:handoffs:create):
+const HELP_HANDOFF = `handoff options (agent token required; consent scope pingroom:handoffs:create):
   -m, --message <text>   The prompt a human reads (required)
       --question         Make it a question (else a simple acknowledge). Also
                          implied whenever one or more --option is given.
@@ -121,19 +125,19 @@ handoff options (agent token required; consent scope pingroom:handoffs:create):
   -d, --data <json>      Structured data object echoed on the handoff
       --wait             Block until acked / answered / expired / cancelled
       --timeout <sec>    Per long-poll hold with --wait (0–20, server caps 25)
-      --github-output <path>  Safely append handoff outputs for GitHub Actions
+      --github-output <path>  Safely append handoff outputs for GitHub Actions`;
 
-handoffs options (agent token required; consent scope pingroom:handoffs:create):
-      --state <s>        open | all (default open)
+const HELP_HANDOFFS = `handoffs options (agent token required; consent scope pingroom:handoffs:create):
+      --state <s>        open | all (default open)`;
 
-listen options (agent token required; consent scope pingroom:notifications:read):
+const HELP_LISTEN = `listen options (agent token required; consent scope pingroom:notifications:read):
       --timeout <sec>    Per long-poll hold (0-30, default 25)
       --limit <n>        Max pings per batch (1-100, default 50)
       --from <id>        Start after this ping id instead of "now"
       --once             Print one batch and exit instead of blocking forever
-      --json             One JSON object per line instead of a readable line
+      --json             One JSON object per line instead of a readable line`;
 
-live <start|update|end|get> options (agent token, or a room webhook):
+const HELP_LIVE = `live <start|update|end|get> options (agent token, or a room webhook):
   -c, --correlation-id <id>  The stream key — reuse it for every ping (required)
       --template <name>      start only: status | steps | progress | metrics |
                              countdown | decision | matchup (fixed at creation;
@@ -163,38 +167,38 @@ live <start|update|end|get> options (agent token, or a room webhook):
       --require-ack          Add an Acknowledge button
       --ack-timeout <s>      Ack deadline in seconds
       --room <code>          Room invite code (used with --token)
-  -w, --webhook <url>        Room webhook URL instead of a token
+  -w, --webhook <url>        Room webhook URL instead of a token`;
 
-hook options (reads a Claude Code event; defaults to stored credentials/config):
+const HELP_HOOK = `hook options (reads a Claude Code event; defaults to stored credentials/config):
       --room <code>      Room invite code (or env/config/paired room)
       --ttl <seconds>    Approval-question expiry for PreToolUse (default 900)
       --quiet            Suppress the informational stderr lines
-      --print-config     Print a ready-to-paste ~/.claude/settings.json block
+      --print-config     Print a ready-to-paste ~/.claude/settings.json block`;
 
-mcp:
+const HELP_MCP = `mcp:
   pingroom mcp                     Print the endpoint and client setup snippets
   pingroom mcp add claude-code     Print the Claude Code setup command
-                                   (output-only; does not change client config)
+                                   (output-only; does not change client config)`;
 
-activate:
+const HELP_ACTIVATE = `activate:
   pingroom activate                Send one test Question to your phone to prove the
                                    saved QR-paired credential works (optional —
-                                   connecting no longer does this for you)
+                                   connecting no longer does this for you)`;
 
-config options:
+const HELP_CONFIG = `config options:
   pingroom config list              Print the stored settings
   pingroom config get <key>         Print one setting
   pingroom config set <key> <val>   Store a setting (an empty value clears it)
-  Keys: default_room, api_url
+  Keys: default_room, api_url`;
 
-Shared:
+const HELP_SHARED = `Shared:
       --token <token>    Agent access token (or env PINGROOM_TOKEN)
       --api <url>        API base URL (default ${DEFAULT_API}; env PINGROOM_API_URL)
       --json             Print the raw JSON response
   -h, --help             Show this help
-  -v, --version          Show the CLI version
+  -v, --version          Show the CLI version`;
 
-Connecting:
+const HELP_TAIL = `Connecting:
   Install globally, then run with no arguments:
     npm install --global @pingroom/cli
     pingroom
@@ -291,6 +295,54 @@ Exit codes: 0 on success (answered / acked), 1 on error (network/auth/5xx),
 or the recipient was not ready (409 recipient_not_ready). A question answered
 with ANY value — including a negative one like 'hold' or 'deny' — exits 0: a
 human decision is not an infrastructure failure.`;
+
+const HELP = [
+  HELP_INTRO, HELP_PING, HELP_ASK, HELP_LIST, HELP_HANDOFF, HELP_HANDOFFS,
+  HELP_LISTEN, HELP_LIVE, HELP_HOOK, HELP_MCP, HELP_ACTIVATE, HELP_CONFIG,
+  HELP_SHARED, HELP_TAIL,
+].join('\n\n');
+
+// Sections for `pingroom <command> --help`. watch/cancel/logout have no block
+// of their own in the full help, so they get a minimal one here.
+const COMMAND_HELP_SECTIONS = {
+  ping: HELP_PING,
+  ask: HELP_ASK,
+  watch: `watch:
+  pingroom watch <question-id>      Block until the question resolves and
+                                    print the outcome
+      --timeout <sec>    Per long-poll hold (0–30, default 25)`,
+  cancel: `cancel:
+  pingroom cancel <question-id>     Withdraw a pending question`,
+  list: HELP_LIST,
+  handoff: HELP_HANDOFF,
+  handoffs: HELP_HANDOFFS,
+  listen: HELP_LISTEN,
+  live: HELP_LIVE,
+  hook: HELP_HOOK,
+  activate: HELP_ACTIVATE,
+  config: HELP_CONFIG,
+  logout: `logout:
+  pingroom logout                   Forget the stored credential (PINGROOM_TOKEN
+                                    in the environment is unaffected)`,
+};
+
+// config and logout are local-only commands that reject --token/--api (and,
+// for logout, --json), so their help gets a footer that only lists what they
+// actually accept instead of the full shared block.
+const COMMAND_HELP_FOOTERS = {
+  config: `Shared:
+      --json             Print the raw JSON response
+  -h, --help             Show this help`,
+  logout: `Shared:
+  -h, --help             Show this help`,
+};
+
+// `<command> --help`: that command's section plus the shared flags, instead of
+// the full reference `pingroom --help` / `pingroom help` still print.
+function commandHelp(name) {
+  const section = COMMAND_HELP_SECTIONS[name];
+  return section ? `${section}\n\n${COMMAND_HELP_FOOTERS[name] ?? HELP_SHARED}` : HELP;
+}
 
 const EXIT = { OK: 0, ERROR: 1, USAGE: 2, EXPIRED: 3, CANCELLED: 4 };
 
@@ -535,11 +587,54 @@ function stripControlChars(value) {
   return String(value).replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
 }
 
+// --- argument parsing -------------------------------------------------------
+
+/**
+ * Build an argv parser from a flag table. Every command parser runs the same
+ * loop; only the tables differ:
+ *   aliases              flag or alias -> canonical args key
+ *   booleans             keys that take no value
+ *   repeatable           keys collected into an array (the flag may repeat)
+ *   bareDashIsPositional whether a lone `-` collects into `_` (the question-
+ *                        style parsers) or fails as an unknown option (ping,
+ *                        live)
+ * Unknown flags always fail as a usage error; bare words collect into `_`.
+ */
+function makeParser({ aliases, booleans, repeatable = [], bareDashIsPositional = false }) {
+  const booleanKeys = new Set(booleans);
+  const repeatableKeys = new Set(repeatable);
+  return function parse(argv) {
+    const args = { _: [] };
+    for (let i = 0; i < argv.length; i++) {
+      const token = argv[i];
+      // Object.hasOwn, not aliases[token]: a bare lookup walks the prototype
+      // chain, so `constructor` / `toString` / `__proto__` in flag position
+      // resolve to a truthy inherited value, get treated as an option, and
+      // swallow the next argument instead of failing as an unknown flag.
+      const key = Object.hasOwn(aliases, token) ? aliases[token] : undefined;
+      if (key && booleanKeys.has(key)) {
+        args[key] = true;
+      } else if (key) {
+        const value = argv[++i];
+        if (value === undefined) {
+          fail(`option ${token} needs a value`, EXIT.USAGE);
+        }
+        if (repeatableKeys.has(key)) (args[key] ||= []).push(value);
+        else args[key] = value;
+      } else if (token.startsWith('-') && !(bareDashIsPositional && token === '-')) {
+        fail(`Unknown option: ${token}`, EXIT.USAGE);
+      } else {
+        args._.push(token);
+      }
+    }
+    return args;
+  };
+}
+
 // --- ping (unchanged wire behaviour) ---------------------------------------
 
-function parseArgs(argv) {
-  const args = { _: [] };
-  const alias = {
+const parseArgs = makeParser({
+  aliases: {
     '-m': 'message', '--message': 'message',
     '-t': 'title', '--title': 'title',
     '-a': 'action', '--action': 'action',
@@ -555,40 +650,15 @@ function parseArgs(argv) {
     '--api': 'api',
     '--json': 'json',
     '-h': 'help', '--help': 'help',
-  };
-  const booleans = new Set(['require_ack', 'json', 'help']);
-  const repeatable = new Set(['attach']);
-
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i];
-    // Object.hasOwn, not alias[token]: a bare lookup walks the prototype chain,
-    // so `constructor` / `toString` / `__proto__` in flag position resolve to a
-    // truthy inherited value, get treated as an option, and swallow the next
-    // argument instead of failing as an unknown flag.
-    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
-    if (key && booleans.has(key)) {
-      args[key] = true;
-    } else if (key) {
-      const value = argv[++i];
-      if (value === undefined) {
-        fail(`option ${token} needs a value`, EXIT.USAGE);
-      }
-      if (repeatable.has(key)) (args[key] ||= []).push(value);
-      else args[key] = value;
-    } else if (token.startsWith('-')) {
-      fail(`Unknown option: ${token}`, EXIT.USAGE);
-    } else {
-      args._.push(token);
-    }
-  }
-  return args;
-}
+  },
+  booleans: ['require_ack', 'json', 'help'],
+  repeatable: ['attach'],
+});
 
 // Parser for the question commands: supports repeatable --option and a trailing
 // positional (a question id). Unknown flags fail like the ping parser.
-function parseQArgs(argv) {
-  const args = { _: [] };
-  const alias = {
+const parseQArgs = makeParser({
+  aliases: {
     '-p': 'prompt', '--prompt': 'prompt',
     '-o': 'option', '--option': 'option',
     '-c': 'context', '--context': 'context',
@@ -611,40 +681,16 @@ function parseQArgs(argv) {
     '--wait': 'wait',
     '--json': 'json',
     '-h': 'help', '--help': 'help',
-  };
-  const booleans = new Set(['wait', 'json', 'help', 'once']);
-  const multi = new Set(['option']);
-
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i];
-    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
-    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
-    if (key && booleans.has(key)) {
-      args[key] = true;
-    } else if (key) {
-      const value = argv[++i];
-      if (value === undefined) {
-        fail(`option ${token} needs a value`, EXIT.USAGE);
-      }
-      if (multi.has(key)) {
-        (args[key] ||= []).push(value);
-      } else {
-        args[key] = value;
-      }
-    } else if (token.startsWith('-') && token !== '-') {
-      fail(`Unknown option: ${token}`, EXIT.USAGE);
-    } else {
-      args._.push(token);
-    }
-  }
-  return args;
-}
+  },
+  booleans: ['wait', 'json', 'help', 'once'],
+  repeatable: ['option'],
+  bareDashIsPositional: true,
+});
 
 // Parser for `handoff`: --message plus repeatable --option, boolean --question,
 // and the handoff-specific flags. Unknown flags fail like the other parsers.
-function parseHandoffArgs(argv) {
-  const args = { _: [] };
-  const alias = {
+const parseHandoffArgs = makeParser({
+  aliases: {
     '-m': 'message', '--message': 'message',
     '--question': 'question',
     '-o': 'option', '--option': 'option',
@@ -662,34 +708,11 @@ function parseHandoffArgs(argv) {
     '--wait': 'wait',
     '--json': 'json',
     '-h': 'help', '--help': 'help',
-  };
-  const booleans = new Set(['question', 'wait', 'json', 'help']);
-  const multi = new Set(['option']);
-
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i];
-    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
-    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
-    if (key && booleans.has(key)) {
-      args[key] = true;
-    } else if (key) {
-      const value = argv[++i];
-      if (value === undefined) {
-        fail(`option ${token} needs a value`, EXIT.USAGE);
-      }
-      if (multi.has(key)) {
-        (args[key] ||= []).push(value);
-      } else {
-        args[key] = value;
-      }
-    } else if (token.startsWith('-') && token !== '-') {
-      fail(`Unknown option: ${token}`, EXIT.USAGE);
-    } else {
-      args._.push(token);
-    }
-  }
-  return args;
-}
+  },
+  booleans: ['question', 'wait', 'json', 'help'],
+  repeatable: ['option'],
+  bareDashIsPositional: true,
+});
 
 // True when a URL is safe to attach a bearer token or webhook secret to: https,
 // or http on loopback so local dev against http://localhost still works.
@@ -854,7 +877,7 @@ async function uploadAttachments(paths, apiBase, token) {
 }
 
 async function ping(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('ping')}\n`); return EXIT.OK; }
 
   const message = args.message;
   if (!message) fail('a --message is required', EXIT.USAGE);
@@ -1000,9 +1023,8 @@ const LIVE_TEMPLATE_NAMES = ['status', 'steps', 'progress', 'metrics', 'countdow
 
 // Parser for `live`: a leading subcommand (start|update|end|get) plus the
 // live-status flags. Unknown flags fail like the other parsers.
-function parseLiveArgs(argv) {
-  const args = { _: [] };
-  const alias = {
+const parseLiveArgs = makeParser({
+  aliases: {
     '-c': 'correlation_id', '--correlation-id': 'correlation_id',
     '-t': 'title', '--title': 'title',
     '-m': 'message', '--message': 'message',
@@ -1031,29 +1053,10 @@ function parseLiveArgs(argv) {
     '--api': 'api',
     '--json': 'json',
     '-h': 'help', '--help': 'help',
-  };
-  const booleans = new Set(['require_ack', 'json', 'help', 'failed']);
-  const repeatable = new Set(['metric', 'option']);
-
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i];
-    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
-    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
-    if (key && booleans.has(key)) {
-      args[key] = true;
-    } else if (key) {
-      const value = argv[++i];
-      if (value === undefined) fail(`option ${token} needs a value`, EXIT.USAGE);
-      if (repeatable.has(key)) (args[key] ||= []).push(value);
-      else args[key] = value;
-    } else if (token.startsWith('-')) {
-      fail(`Unknown option: ${token}`, EXIT.USAGE);
-    } else {
-      args._.push(token);
-    }
-  }
-  return args;
-}
+  },
+  booleans: ['require_ack', 'json', 'help', 'failed'],
+  repeatable: ['metric', 'option'],
+});
 
 // "label:value" -> {label, value}. Only the first colon splits.
 function buildMetrics(list) {
@@ -1115,6 +1118,7 @@ function numberOption(raw, flag, { min, max, integer = false } = {}) {
  * (--webhook), which speak the same `live_status` contract.
  */
 async function live(args) {
+  if (args.help) { process.stdout.write(`${commandHelp('live')}\n`); return EXIT.OK; }
   const sub = args._[0];
   const known = ['start', 'update', 'end', 'get'];
   if (!sub || !known.includes(sub)) {
@@ -1357,7 +1361,7 @@ async function waitForResolution(id, args, { token, apiBase }) {
 }
 
 async function ask(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('ask')}\n`); return EXIT.OK; }
 
   const prompt = args.prompt;
   if (!prompt) fail('a --prompt is required', EXIT.USAGE);
@@ -1415,7 +1419,7 @@ async function ask(args) {
 }
 
 async function watch(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('watch')}\n`); return EXIT.OK; }
   const id = args._[0];
   if (!id) fail('a question id is required (pingroom watch <id>)', EXIT.USAGE);
   const { token, apiBase } = agentContext(args);
@@ -1423,7 +1427,7 @@ async function watch(args) {
 }
 
 async function cancel(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('cancel')}\n`); return EXIT.OK; }
   const id = args._[0];
   if (!id) fail('a question id is required (pingroom cancel <id>)', EXIT.USAGE);
   const { token, apiBase } = agentContext(args);
@@ -1439,7 +1443,7 @@ async function cancel(args) {
 }
 
 async function list(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('list')}\n`); return EXIT.OK; }
   const { token, apiBase } = agentContext(args);
   const qs = args.state ? `?state=${encodeURIComponent(args.state)}` : '';
   const url = `${apiBase}/api/agent/questions${qs}`;
@@ -1471,7 +1475,7 @@ async function list(args) {
 
 /** Cursor bookkeeping is the whole protocol: `after` in, `cursor` back. */
 async function listen(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('listen')}\n`); return EXIT.OK; }
 
   const { token, apiBase } = agentContext(args);
   const headers = { Authorization: `Bearer ${token}` };
@@ -1552,7 +1556,7 @@ function formatIncoming(item) {
 }
 
 async function listHandoffs(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('handoffs')}\n`); return EXIT.OK; }
   const { token, apiBase } = agentContext(args);
   const state = args.state || 'open';
   if (state !== 'open' && state !== 'all') {
@@ -1700,7 +1704,7 @@ async function waitForHandoff(id, args, { token, apiBase }, initialDeliveryState
 }
 
 async function handoff(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('handoff')}\n`); return EXIT.OK; }
 
   const message = args.message;
   if (!message) fail('a --message is required', EXIT.USAGE);
@@ -1792,9 +1796,8 @@ async function handoff(args) {
 // normal local prompt (PreToolUse -> permissionDecision "ask") and exits 0. It
 // must not call fail() (a non-zero exit — 2 especially — would break the run).
 
-function parseHookArgs(argv) {
-  const args = { _: [] };
-  const alias = {
+const parseHookArgs = makeParser({
+  aliases: {
     '--room': 'room',
     '--ttl': 'ttl',
     '--quiet': 'quiet',
@@ -1803,27 +1806,10 @@ function parseHookArgs(argv) {
     '--api': 'api',
     '--json': 'json',
     '-h': 'help', '--help': 'help',
-  };
-  const booleans = new Set(['quiet', 'print_config', 'json', 'help']);
-
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i];
-    // hasOwn, not a bare lookup — see parseArgs: an inherited key would swallow args.
-    const key = Object.hasOwn(alias, token) ? alias[token] : undefined;
-    if (key && booleans.has(key)) {
-      args[key] = true;
-    } else if (key) {
-      const value = argv[++i];
-      if (value === undefined) fail(`option ${token} needs a value`, EXIT.USAGE);
-      args[key] = value;
-    } else if (token.startsWith('-') && token !== '-') {
-      fail(`Unknown option: ${token}`, EXIT.USAGE);
-    } else {
-      args._.push(token);
-    }
-  }
-  return args;
-}
+  },
+  booleans: ['quiet', 'print_config', 'json', 'help'],
+  bareDashIsPositional: true,
+});
 
 // Read all of stdin as a string. Resolves '' when nothing is piped (TTY), so a
 // stray `pingroom hook` in a terminal is a silent no-op rather than a hang.
@@ -2085,7 +2071,7 @@ ${JSON.stringify(config, null, 2)}
 }
 
 async function hook(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('hook')}\n`); return EXIT.OK; }
   if (args.print_config) { printHookConfig(); return EXIT.OK; }
 
   let event = {};
@@ -2601,7 +2587,7 @@ async function activateInboxAfterPairing(cred) {
 
 /** Retry activation only for the durable credential created by QR pairing. */
 async function activateStoredInbox(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('activate')}\n`); return EXIT.OK; }
   if (args._.length > 0) fail('usage: pingroom activate', EXIT.USAGE);
   if (args.token !== undefined) {
     fail('pingroom activate uses the saved QR-paired credential; remove --token', EXIT.USAGE);
@@ -2954,7 +2940,7 @@ const CONFIG_KEYS = {
 };
 
 async function config(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('config')}\n`); return EXIT.OK; }
 
   const sub = args._[0];
   const known = ['list', 'get', 'set'];
@@ -3012,7 +2998,7 @@ async function config(args) {
 // --- logout ----------------------------------------------------------------
 
 async function logout(args) {
-  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+  if (args.help) { process.stdout.write(`${commandHelp('logout')}\n`); return EXIT.OK; }
 
   const path = credentialsPath();
   const stored = readStoredCredential();
@@ -3034,6 +3020,33 @@ async function logout(args) {
   return EXIT.OK;
 }
 
+// config/logout/handoffs used to share parseQArgs, which silently accepted and
+// ignored flags those commands never read (`logout --wait --prompt x`). Minimal
+// tables instead, so an irrelevant flag is a usage error like everywhere else.
+const parseConfigArgs = makeParser({
+  aliases: { '--json': 'json', '-h': 'help', '--help': 'help' },
+  booleans: ['json', 'help'],
+  bareDashIsPositional: true,
+});
+
+const parseLogoutArgs = makeParser({
+  aliases: { '-h': 'help', '--help': 'help' },
+  booleans: ['help'],
+  bareDashIsPositional: true,
+});
+
+const parseHandoffsArgs = makeParser({
+  aliases: {
+    '--state': 'state',
+    '--token': 'token',
+    '--api': 'api',
+    '--json': 'json',
+    '-h': 'help', '--help': 'help',
+  },
+  booleans: ['json', 'help'],
+  bareDashIsPositional: true,
+});
+
 const COMMANDS = {
   ping: (rest) => ping(parseArgs(rest)),
   ask: (rest) => ask(parseQArgs(rest)),
@@ -3042,14 +3055,14 @@ const COMMANDS = {
   cancel: (rest) => cancel(parseQArgs(rest)),
   list: (rest) => list(parseQArgs(rest)),
   handoff: (rest) => handoff(parseHandoffArgs(rest)),
-  handoffs: (rest) => listHandoffs(parseQArgs(rest)),
+  handoffs: (rest) => listHandoffs(parseHandoffsArgs(rest)),
   listen: (rest) => listen(parseQArgs(rest)),
   hook: (rest) => hook(parseHookArgs(rest)),
   mcp,
   activate: (rest) => activateStoredInbox(parseQArgs(rest)),
   live: (rest) => live(parseLiveArgs(rest)),
-  config: (rest) => config(parseQArgs(rest)),
-  logout: (rest) => logout(parseQArgs(rest)),
+  config: (rest) => config(parseConfigArgs(rest)),
+  logout: (rest) => logout(parseLogoutArgs(rest)),
 };
 
 function waitFrom(handler, rest) {

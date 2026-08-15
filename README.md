@@ -6,9 +6,10 @@ from CI, scripts, and agents. Delivered as push straight to your phone.
 One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
 anywhere Node ≥ 20 runs.
 
-> **Release status:** npm serves 0.6.2, including the corrected attachment
-> limits. The published package and public GitHub Action are aligned and have
-> been clean-install verified.
+> **Release status:** 0.7.0 is prepared for publish — the room grant, the
+> `attachments:write` scope `--attach` always needed, and actionable text on the
+> refusals you can fix. The GitHub Action pins 0.7.0, so publish before relying
+> on it.
 
 ## Install and first run
 
@@ -94,6 +95,22 @@ first.
 There is deliberately no `login` command: being unconnected is a state the tool
 resolves, not one you have to discover. Once connected, bare `pingroom` prints
 that status line followed by the usual help.
+
+### What the approval grants
+
+Approving on the phone grants two separate things, and both are enforced:
+
+- **Permissions** — the scopes this CLI asks for: `rooms:read`,
+  `broadcast:send`, `attachments:write`, `questions:ask`, `handoffs:create`,
+  `live:write`. Nothing widens them later; a command needing one you did not
+  approve returns `403 insufficient_scope`.
+- **Rooms** — one room, several, or all of them. A room outside that grant
+  returns `403 room_not_granted` on any write, including pings, questions and
+  live streams. Widen it under Connected Agents in the app.
+
+Both refusals print the fix, not just the code. A credential paired by an older
+CLI carries the scope set that version asked for — reconnect to re-approve if a
+command starts reporting `insufficient_scope`.
 
 The credential lands in `~/.pingroom/credentials.json` (mode `0600`, inside a
 `0700` directory). `PINGROOM_HOME` moves that directory; `pingroom logout`
@@ -223,6 +240,7 @@ pingroom live <start|update|end|get> [options]
       --center <text>        Center score/clock, <= 40 (matchup template)
       --accent-override <#rrggbb>  Semantic accent for this frame
       --failed               end only: finish as failed instead of done
+  -d, --data <json>          Structured data object carried on this frame
   -t, --title <text>         Card title (<= 40 chars)
   -a, --action <1-4>         Quick-action slot supplying the icon and sound
       --require-ack          Add an Acknowledge button

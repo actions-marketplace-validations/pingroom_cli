@@ -40,7 +40,7 @@ import { join } from 'node:path';
 // Kept in lockstep with package.json / package-lock.json. The GitHub Action is
 // pinned independently to the latest version already published on npm; a test
 // makes that release gate explicit. `hook --print-config` emits this candidate.
-const VERSION = '0.6.2';
+const VERSION = '0.7.0';
 
 const BUILTIN_API = 'https://api.pingroom.io';
 const MCP_ENDPOINT = `${BUILTIN_API}/api/agent/mcp`;
@@ -146,6 +146,7 @@ live <start|update|end|get> options (agent token, or a room webhook):
       --center <text>        Center score/clock, <= 40 (matchup template)
       --accent-override <#rrggbb>  Semantic accent for this frame
       --failed               end only: finish as failed instead of done
+  -d, --data <json>          Structured data object carried on this frame
   -t, --title <text>         Card title (<= 40 chars)
   -a, --action <1-4>         Quick-action slot supplying the icon and sound
       --require-ack          Add an Acknowledge button
@@ -285,6 +286,32 @@ const EXIT = { OK: 0, ERROR: 1, USAGE: 2, EXPIRED: 3, CANCELLED: 4 };
 function fail(message, code = EXIT.ERROR) {
   process.stderr.write(`pingroom: ${message}\n`);
   process.exit(code);
+}
+
+/**
+ * The fixes that live on THIS side of the wire. The server's message always
+ * leads; these are appended only for the codes where the operator would
+ * otherwise have no way to know what to do next, and where the answer is a
+ * local action rather than "try again".
+ */
+const API_HINTS = {
+  room_not_granted:
+    'That room is outside the grant this agent was given. Add it under Connected Agents in the PingRoom app, or run "pingroom" to reconnect and pick it.',
+  insufficient_scope:
+    'This credential was approved before the command needed that permission. Run "pingroom" to reconnect and re-approve.',
+  no_room_configured:
+    'This agent has no delivery room. Pick one under Connected Agents in the PingRoom app.',
+};
+
+/**
+ * What to print when an API call fails: the server's own wording, plus the one
+ * thing that would fix it when we know one.
+ */
+function apiDetail(res, json) {
+  const base =
+    (json && (json.message || json.error || json.code)) || `HTTP ${res ? res.status : 'error'}`;
+  const hint = json && typeof json.code === 'string' ? API_HINTS[json.code] : undefined;
+  return hint ? `${base}\n  ${hint}` : base;
 }
 
 // --- local state (~/.pingroom) ---------------------------------------------
@@ -772,7 +799,7 @@ async function uploadAttachments(paths, apiBase, token) {
       fail(`--attach ${name}: ping attachments are a Pro feature`, EXIT.USAGE);
     }
     if (!res.ok || !json?.attachment?.id) {
-      const detail = json?.message || json?.error || `HTTP ${res.status}`;
+      const detail = apiDetail(res, json);
       fail(`upload failed for ${name}: ${detail}`);
     }
 
@@ -890,7 +917,7 @@ async function ping(args) {
   const ok = res.ok && !(json && json.success === false);
 
   if (!ok) {
-    const detail = (json && (json.message || json.error)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     fail(`delivery failed: ${detail}`);
   }
 
@@ -1045,7 +1072,7 @@ async function live(args) {
     const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
     if (args.json) process.stdout.write(`${text || '{}'}\n`);
     if (!res.ok) {
-      fail(`read failed: ${(json && (json.message || json.code)) || `HTTP ${res.status}`}`);
+      fail(`read failed: ${apiDetail(res, json)}`);
     }
     if (!args.json) process.stdout.write(`${(json && json.state) || 'unknown'}\n`);
     return EXIT.OK;
@@ -1151,7 +1178,7 @@ async function live(args) {
   if (args.json) process.stdout.write(`${text || '{}'}\n`);
 
   if (!res.ok || (json && json.success === false)) {
-    const detail = (json && (json.message || json.error || json.code)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     fail(`live ${sub} failed: ${detail}`);
   }
 
@@ -1242,7 +1269,7 @@ async function waitForResolution(id, args, { token, apiBase }) {
     const url = `${apiBase}/api/agent/questions/${encodeURIComponent(id)}/wait?timeout=${hold}`;
     const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) {
-      const detail = (json && (json.message || json.code)) || `HTTP ${res.status}`;
+      const detail = apiDetail(res, json);
       fail(`wait failed: ${detail}`);
     }
     if (json && json.state && json.state !== 'pending') {
@@ -1294,7 +1321,7 @@ async function ask(args) {
   const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(room)}/questions`;
   const { res, text, json } = await httpJson('POST', url, { body, headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) {
-    const detail = (json && (json.message || json.code)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     fail(`ask failed: ${detail}`);
   }
 
@@ -1323,7 +1350,7 @@ async function cancel(args) {
   const url = `${apiBase}/api/agent/questions/${encodeURIComponent(id)}/cancel`;
   const { res, text, json } = await httpJson('POST', url, { body: {}, headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) {
-    const detail = (json && (json.message || json.code)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     fail(`cancel failed: ${detail}`);
   }
   if (args.json) process.stdout.write(`${text}\n`);
@@ -1338,7 +1365,7 @@ async function list(args) {
   const url = `${apiBase}/api/agent/questions${qs}`;
   const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) {
-    const detail = (json && (json.message || json.code)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     fail(`list failed: ${detail}`);
   }
   if (args.json) { process.stdout.write(`${text}\n`); return EXIT.OK; }
@@ -1363,7 +1390,7 @@ async function listHandoffs(args) {
   const url = `${apiBase}/api/agent/handoffs?state=${encodeURIComponent(state)}`;
   const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) {
-    const detail = (json && (json.message || json.code)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     fail(`handoffs list failed: ${detail}`);
   }
   if (args.json) { process.stdout.write(`${text}\n`); return EXIT.OK; }
@@ -1479,7 +1506,7 @@ async function waitForHandoff(id, args, { token, apiBase }, initialDeliveryState
     const url = `${apiBase}/api/agent/handoffs/${encodeURIComponent(id)}/wait?timeout=${hold}`;
     const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) {
-      const detail = (json && (json.message || json.code)) || `HTTP ${res.status}`;
+      const detail = apiDetail(res, json);
       fail(`wait failed: ${detail}`);
     }
     if (json && json.state && !HANDOFF_PENDING.has(json.state)) {
@@ -1552,7 +1579,7 @@ async function handoff(args) {
   const { res, text, json } = await httpJson('POST', url, { body, headers });
   if (!res.ok) {
     const code = json && json.code;
-    const detail = (json && (json.message || code)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     // A recipient who isn't reachable yet is a distinct, retriable outcome (4),
     // not a generic error — CI may want to wait and retry rather than fail hard.
     if (res.status === 409 && code === 'recipient_not_ready') {
@@ -1655,7 +1682,7 @@ async function hookFetch(method, url, { body, token } = {}) {
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON response */ }
   if (!res.ok) {
-    throw new Error((json && (json.message || json.code)) || `HTTP ${res.status}`);
+    throw new Error(apiDetail(res, json));
   }
   return json;
 }
@@ -1984,6 +2011,7 @@ This command only prints setup instructions and does not modify client config.
 const CLI_SCOPES = [
   'pingroom:rooms:read',        // resolve/display the connected room
   'pingroom:broadcast:send',    // ping
+  'pingroom:attachments:write', // ping --attach (the upload leg)
   'pingroom:questions:ask',     // ask / watch / cancel / list, and the hook
   'pingroom:handoffs:create',   // handoff / handoffs
   'pingroom:live:write',        // live start/update/end/get
@@ -2119,7 +2147,7 @@ async function registerAnonymous(apiBase) {
     body: { type: 'anonymous', agent_label: AGENT_LABEL, scopes: CLI_SCOPES },
   });
   if (!res.ok || !json || typeof json.credential !== 'string') {
-    const detail = (json && (json.message || json.error || json.code)) || `HTTP ${res.status}`;
+    const detail = apiDetail(res, json);
     fail(`could not start a connection: ${detail}`);
   }
   return json.credential;
@@ -2525,7 +2553,7 @@ async function connectByPairing(apiBase, ask) {
 
       if (!res.ok) {
         process.stdout.write('\n');
-        const detail = (json && (json.message || json.error || json.code)) || `HTTP ${res.status}`;
+        const detail = apiDetail(res, json);
         fail(`pairing failed: ${detail}`);
       }
       const status = json && json.status;

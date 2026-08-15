@@ -43,20 +43,20 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.6\.2/);
+  assert.match(action, /@pingroom\/cli@0\.7\.0/);
 });
 
 test('source versions align while the GitHub Action stays on the published release', () => {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.6.2');
+  assert.equal(pkg.version, '0.7.0');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   // The Action must pin the concrete, clean-install-verified npm release, never
   // a range or `latest`.
   const pinned = action.match(/@pingroom\/cli@(\d+\.\d+\.\d+)/)?.[1];
-  assert.equal(pinned, '0.6.2');
+  assert.equal(pinned, '0.7.0');
 });
 
 /**
@@ -1017,7 +1017,7 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.6\.2 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.7\.0 hook/);
   assert.match(stdout, /stored credential and paired room automatically/);
   assert.doesNotMatch(stdout, /^#\s+export PINGROOM_TOKEN/m);
 });
@@ -2014,6 +2014,10 @@ test('pairing renders a QR, polls to active, and stores a 0600 credential', asyn
     assert.equal(register.type, 'anonymous');
     assert.ok(register.scopes.includes('pingroom:handoffs:create'));
     assert.ok(register.scopes.includes('pingroom:questions:ask'));
+    // --attach uploads through /agent/attachments, which is its own consent
+    // scope. Asking for it at pairing is what keeps the flag usable on a
+    // QR-paired credential rather than 403ing after the bytes are read.
+    assert.ok(register.scopes.includes('pingroom:attachments:write'));
     // pair/start and every poll present the pre-claim credential.
     assert.equal(received[1].auth, 'Bearer pre_claim_jwt');
     assert.deepEqual(JSON.parse(received[1].body).scopes, register.scopes);
@@ -3251,5 +3255,41 @@ test('--attach surfaces the Pro gate instead of a bare HTTP error', async () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
     server.close();
+  }
+});
+
+test('a refusal the operator can fix carries the fix, not just the code', async () => {
+  const cases = [
+    {
+      status: 403,
+      body: {
+        code: 'room_not_granted',
+        message: 'This agent was not given access to that room.',
+      },
+      expect: /Connected Agents in the PingRoom app/,
+    },
+    {
+      status: 403,
+      body: { code: 'insufficient_scope', message: 'This credential lacks the required scope.' },
+      expect: /reconnect and re-approve/,
+    },
+  ];
+
+  for (const { status: httpStatus, body, expect } of cases) {
+    const { server, baseUrl } = await startServer((req, res) => {
+      res.writeHead(httpStatus, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+    try {
+      const { status, stderr } = await runAsync([
+        'ping', '-m', 'hi', '--token', 'tok', '--room', 'AB12', '--api', baseUrl,
+      ]);
+      assert.equal(status, 1);
+      // The server's own wording still leads.
+      assert.match(stderr, new RegExp(body.message.slice(0, 24).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.match(stderr, expect);
+    } finally {
+      server.close();
+    }
   }
 });

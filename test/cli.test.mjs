@@ -3324,3 +3324,130 @@ test('an unknown template names the alias, not the wire id, in the usage error',
   assert.match(stderr, /decision/);
   assert.doesNotMatch(stderr, /question/);
 });
+
+test('listen establishes a cursor from "now", then prints what lands', async () => {
+  const seen = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    seen.push(url.searchParams.get('after'));
+    const body = url.searchParams.get('after')
+      ? {
+          notifications: [
+            {
+              id: 'n2',
+              message: 'Build 512 is green',
+              correlation_id: 'deploy-512',
+              room: { code: 'AB12', name: 'Project X' },
+            },
+          ],
+          cursor: 'n2',
+        }
+      // No `after` → the head id and no rows, so startup never replays history.
+      : { notifications: [], cursor: 'n1' };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  });
+
+  try {
+    const { status, stdout } = await runAsync(
+      ['listen', '--once', '--token', 'tok', '--api', baseUrl],
+      {},
+      { timeoutMs: 8000 },
+    );
+    assert.equal(status, 0);
+    assert.match(stdout, /\[Project X\] Build 512 is green/);
+    assert.match(stdout, /corr=deploy-512/);
+    // First call carries no cursor; the second is bounded by the head id.
+    assert.equal(seen[0], null);
+    assert.equal(seen[1], 'n1');
+  } finally {
+    server.close();
+  }
+});
+
+test('listen --from skips the cursor handshake and honours --json', async () => {
+  const seen = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    seen.push(new URL(req.url, 'http://x').searchParams.get('after'));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      notifications: [{ id: 'n9', message: 'hi', room: { code: 'AB12', name: 'R' } }],
+      cursor: 'n9',
+    }));
+  });
+
+  try {
+    const { status, stdout } = await runAsync(
+      ['listen', '--once', '--from', 'n5', '--json', '--token', 'tok', '--api', baseUrl],
+      {},
+      { timeoutMs: 8000 },
+    );
+    assert.equal(status, 0);
+    assert.equal(seen.length, 1, 'an explicit --from needs no handshake request');
+    assert.equal(seen[0], 'n5');
+    assert.equal(JSON.parse(stdout.trim()).id, 'n9');
+  } finally {
+    server.close();
+  }
+});
+
+test('listen refuses out-of-range holds locally, and needs a token', async () => {
+  const over = await runAsync(['listen', '--timeout', '99', '--token', 't', '--api', 'https://api.pingroom.io']);
+  assert.equal(over.status, 2);
+  assert.match(over.stderr, /--timeout must be at most 30/);
+
+  const noToken = await runAsync(['listen', '--api', 'https://api.pingroom.io']);
+  assert.equal(noToken.status, 2);
+  assert.match(noToken.stderr, /agent token is required/);
+});
+
+test('over-long fields fail locally with the limit named, not as a 422', async () => {
+  let requests = 0;
+  const { server, baseUrl } = await startServer((req, res) => {
+    requests += 1;
+    res.writeHead(201, { 'Content-Type': 'application/json' });
+    res.end('{"id":"n1"}');
+  });
+
+  const cases = [
+    { argv: ['ping', '-m', 'x'.repeat(501)], expect: /--message must be at most 500 characters \(got 501\)/ },
+    { argv: ['ping', '-m', 'ok', '-t', 'x'.repeat(41)], expect: /--title must be at most 40 characters/ },
+    { argv: ['ask', '-p', 'x'.repeat(501)], expect: /--prompt must be at most 500 characters/ },
+    { argv: ['ask', '-p', 'ok', '-c', 'x'.repeat(41)], expect: /--context must be at most 40 characters/ },
+    // The live card's message is 256, not the 500 a ping body gets.
+    { argv: ['live', 'start', '-c', 'x', '-m', 'x'.repeat(257)], expect: /--message must be at most 256 characters/ },
+  ];
+
+  try {
+    for (const { argv, expect } of cases) {
+      const { status, stderr } = await runAsync([...argv, '--token', 'tok', '--room', 'AB12', '--api', baseUrl]);
+      assert.equal(status, 2, argv.join(' '));
+      assert.match(stderr, expect);
+    }
+    assert.equal(requests, 0, 'a local usage error must not reach the network');
+  } finally {
+    server.close();
+  }
+});
+
+test('an unexpected error prints one line, not a stack trace', async () => {
+  // A body that is not JSON at all, on a 200, drives the parser off its
+  // expected shape — whatever escapes must still read like a CLI error.
+  const { server, baseUrl } = await startServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"notifications": "not-an-array", "cursor": 5}');
+  });
+
+  try {
+    const { status, stderr } = await runAsync(
+      ['listen', '--once', '--from', 'n1', '--token', 'tok', '--api', baseUrl],
+      {},
+      { timeoutMs: 8000 },
+    );
+    // Either it copes (0) or it fails cleanly (1) — never a raw stack.
+    assert.ok(status === 0 || status === 1, `unexpected exit ${status}`);
+    assert.doesNotMatch(stderr, /at .*bin\/pingroom\.js:\d+/);
+  } finally {
+    server.close();
+  }
+});

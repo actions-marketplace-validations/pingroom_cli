@@ -43,7 +43,8 @@ pingroom ping -m "Deploy succeeded ✅"
 
 Commands: `ping` (send), `ask` (ask a human), `watch` (block on an existing
 question), `list`, `cancel`, `handoff` (hand a decision to a specific human),
-`handoffs` (list open or recent Handoffs), `live` (lock-screen progress card),
+`handoffs` (list open or recent Handoffs), `listen` (hear pings as they land),
+`live` (lock-screen progress card),
 `hook` (Claude Code), `mcp` (client setup), `activate` (send an optional test
 Question), `config`, and `logout`.
 Run `pingroom --help` for the full reference.
@@ -101,9 +102,9 @@ that status line followed by the usual help.
 Approving on the phone grants two separate things, and both are enforced:
 
 - **Permissions** — the scopes this CLI asks for: `rooms:read`,
-  `broadcast:send`, `attachments:write`, `questions:ask`, `handoffs:create`,
-  `live:write`. Nothing widens them later; a command needing one you did not
-  approve returns `403 insufficient_scope`.
+  `broadcast:send`, `attachments:write`, `notifications:read`, `questions:ask`,
+  `handoffs:create`, `live:write`. Nothing widens them later; a command needing
+  one you did not approve returns `403 insufficient_scope`.
 - **Rooms** — one room, several, or all of them. A room outside that grant
   returns `403 room_not_granted` on any write, including pings, questions and
   live streams. Widen it under Connected Agents in the app.
@@ -219,6 +220,33 @@ A **live-status stream** is one long-running thing shown as a self-updating card
 on the Lock Screen (iOS Live Activity / Dynamic Island, Android live update, and
 a full inline card in the app). `start` opens it with one alert, `update` moves
 it **silently**, `end` closes it with one completion alert.
+
+## Hearing replies
+
+Everything else here talks; `listen` is how an agent hears — replies to its own
+structured pings, a human's ping in a room it belongs to, anything landing while
+it works.
+
+```bash
+pingroom listen                      # block, printing each ping as it lands
+pingroom listen --once --json        # one batch as JSON, then exit
+pingroom listen --from "$LAST_ID"    # catch up from a known ping id
+```
+
+```
+      --timeout <sec>    Per long-poll hold (0-30, default 25)
+      --limit <n>        Max pings per batch (1-100, default 50)
+      --from <id>        Start after this ping id instead of "now"
+      --once             Print one batch and exit instead of blocking forever
+      --json             One JSON object per line instead of a readable line
+```
+
+The server holds each request open until something arrives, so this is a
+long-poll rather than a poll loop: an idle hour costs about 144 requests, not
+one per second. With no `--from` it starts from *now* — the first call takes the
+head cursor and returns nothing, so starting up never replays history. Transient
+failures (429, 5xx, network) back off geometrically and keep listening;
+`--once` is the form to use in a script.
 
 ```
 pingroom live <start|update|end|get> [options]

@@ -19,6 +19,7 @@
 //   handoff  Hand a decision to a specific human (ack or question) and, with
 //            --wait, block until they acknowledge / answer.
 //   handoffs List the agent's open handoffs or bounded recent history.
+//   listen   Long-poll for pings arriving in the agent's rooms.
 //   live     Drive a live progress card (iOS Live Activity / Android live
 //            update) on the room members' lock screen: start / update / end.
 //   mcp      Print the canonical remote MCP endpoint and client setup snippets.
@@ -60,6 +61,7 @@ Commands:
   handoff  Hand a decision (ack or question) to a specific human; with --wait,
            block until they acknowledge or answer
   handoffs List the agent's open handoffs or bounded recent history
+  listen   Block on pings arriving in your rooms and print them as they land
   live     Drive a live progress card on the lock screen (Live Activity)
   hook     Claude Code hook: ping on Stop/Notification, and route tool
            permission prompts to a PingRoom question you answer from your phone
@@ -123,6 +125,13 @@ handoff options (agent token required; consent scope pingroom:handoffs:create):
 
 handoffs options (agent token required; consent scope pingroom:handoffs:create):
       --state <s>        open | all (default open)
+
+listen options (agent token required; consent scope pingroom:notifications:read):
+      --timeout <sec>    Per long-poll hold (0-30, default 25)
+      --limit <n>        Max pings per batch (1-100, default 50)
+      --from <id>        Start after this ping id instead of "now"
+      --once             Print one batch and exit instead of blocking forever
+      --json             One JSON object per line instead of a readable line
 
 live <start|update|end|get> options (agent token, or a room webhook):
   -c, --correlation-id <id>  The stream key — reuse it for every ping (required)
@@ -491,6 +500,20 @@ function sleep(ms) {
 // Drop C0/C1 control characters before echoing server-supplied text to the
 // terminal. Without this an attacker-controlled API base can smuggle ANSI
 // escapes into the output and repaint, erase or overwrite the lines around them.
+/**
+ * Reject an over-long field here rather than letting it become a 422.
+ *
+ * Every bound mirrors a Laravel rule (StoreNotificationRequest,
+ * StoreQuestionRequest, LiveStatusRules) and is documented in --help, so a value
+ * past it was always going to be refused — locally it reads as the usage error
+ * it is, with the limit and the actual length named.
+ */
+function requireMaxLength(value, max, flag) {
+  if (typeof value === 'string' && value.length > max) {
+    fail(`${flag} must be at most ${max} characters (got ${value.length})`, EXIT.USAGE);
+  }
+}
+
 function stripControlChars(value) {
   // eslint-disable-next-line no-control-regex
   return String(value).replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
@@ -563,6 +586,9 @@ function parseQArgs(argv) {
     '--text-max': 'text_max',
     '--timeout': 'timeout',
     '--state': 'state',
+    '--limit': 'limit',
+    '--from': 'from',
+    '--once': 'once',
     '--token': 'token',
     '--room': 'room',
     '--api': 'api',
@@ -570,7 +596,7 @@ function parseQArgs(argv) {
     '--json': 'json',
     '-h': 'help', '--help': 'help',
   };
-  const booleans = new Set(['wait', 'json', 'help']);
+  const booleans = new Set(['wait', 'json', 'help', 'once']);
   const multi = new Set(['option']);
 
   for (let i = 0; i < argv.length; i++) {
@@ -816,6 +842,8 @@ async function ping(args) {
 
   const message = args.message;
   if (!message) fail('a --message is required', EXIT.USAGE);
+  requireMaxLength(message, 500, '--message');
+  requireMaxLength(args.title, 40, '--title');
 
   if (args.action !== undefined && !/^[1-4]$/.test(String(args.action))) {
     fail('--action must be an integer 1–4', EXIT.USAGE);
@@ -1104,6 +1132,11 @@ async function live(args) {
     state: sub === 'end' ? (args.failed ? 'failed' : 'done') : 'running',
   };
 
+  // 256, not the 500 a ping body gets: this is the card's one live line.
+  requireMaxLength(args.message, 256, '--message');
+  requireMaxLength(args.title, 40, '--title');
+  requireMaxLength(args.prompt, 256, '--prompt');
+  requireMaxLength(args.center, 40, '--center');
   if (args.message !== undefined) liveStatus.message = args.message;
   if (args.prompt !== undefined) liveStatus.prompt = args.prompt;
 
@@ -1309,6 +1342,8 @@ async function ask(args) {
 
   const prompt = args.prompt;
   if (!prompt) fail('a --prompt is required', EXIT.USAGE);
+  requireMaxLength(prompt, 500, '--prompt');
+  requireMaxLength(args.context, 40, '--context');
 
   const { token, apiBase, room } = agentContext(args, { needRoom: true });
 
@@ -1400,6 +1435,98 @@ async function list(args) {
     process.stdout.write(`${q.id}  ${String(q.state).padEnd(9)}  ${q.prompt}${answer}\n`);
   }
   return EXIT.OK;
+}
+
+// --- listen ----------------------------------------------------------------
+//
+// The inbound half. Everything else here talks; this is how an agent hears —
+// replies to its own structured pings, a human's ping in a room it belongs to,
+// anything landing while it works.
+//
+// The server holds each request open until something arrives or the timeout
+// elapses, so this is a long-poll, not a poll loop: an idle hour costs ~144
+// requests, not one per second.
+
+/** Cursor bookkeeping is the whole protocol: `after` in, `cursor` back. */
+async function listen(args) {
+  if (args.help) { process.stdout.write(`${HELP}\n`); return EXIT.OK; }
+
+  const { token, apiBase } = agentContext(args);
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const timeout = numberOption(args.timeout, '--timeout', { min: 0, max: 30, integer: true }) ?? 25;
+  const limit = numberOption(args.limit, '--limit', { min: 1, max: 100, integer: true }) ?? 50;
+
+  // No cursor means "from now": the server answers an empty `after` with the
+  // head id and no rows, so starting up never replays history the agent has
+  // already seen. `--from` opts into catching up from a known id instead.
+  let cursor = args.from;
+  if (!cursor) {
+    const { res, json } = await httpJson('GET', `${apiBase}/api/agent/notifications/wait`, {
+      headers,
+      soft: true,
+    });
+    if (!res?.ok) fail(`listen failed: ${apiDetail(res, json)}`);
+    cursor = json && json.cursor;
+    if (!cursor) {
+      // A brand-new account with no pings at all has no head id. Nothing is
+      // wrong; there is simply nothing to be after yet.
+      cursor = '';
+    }
+  }
+
+  let transientRun = 0;
+
+  for (;;) {
+    const query = new URLSearchParams({ timeout: String(timeout), limit: String(limit) });
+    if (cursor) query.set('after', cursor);
+
+    const { res, json, error } = await httpJson(
+      'GET',
+      `${apiBase}/api/agent/notifications/wait?${query}`,
+      // The hold plus headroom: aborting at exactly the server's deadline would
+      // race it and turn every quiet window into a client-side error.
+      { headers, soft: true, signal: AbortSignal.timeout((timeout + 10) * 1000) },
+    );
+
+    if (error || res.status === 429 || res.status >= 500) {
+      transientRun += 1;
+      const retryAfter = res?.status === 429 ? retryAfterMs(res) : null;
+      // Geometric backoff so a real outage is not also a thundering herd. The
+      // loop is unbounded by design — `listen` is a daemon, not a request.
+      const backoff = Math.min(1000 * 2 ** Math.max(0, transientRun - 1), 30_000);
+      await sleep(Math.max(0, retryAfter ?? backoff));
+      continue;
+    }
+
+    if (!res.ok) fail(`listen failed: ${apiDetail(res, json)}`);
+    transientRun = 0;
+
+    const batch = Array.isArray(json?.notifications) ? json.notifications : [];
+    for (const item of batch) {
+      process.stdout.write(args.json ? `${JSON.stringify(item)}\n` : `${formatIncoming(item)}\n`);
+    }
+    // Advance only on a cursor the server actually returned, or a batch could be
+    // replayed forever against a stale `after`.
+    if (json && typeof json.cursor === 'string' && json.cursor) cursor = json.cursor;
+
+    if (args.once) return EXIT.OK;
+  }
+}
+
+/** One readable line per incoming ping. */
+function formatIncoming(item) {
+  const room = item?.room?.name || item?.room?.code || '?';
+  const body = stripControlChars(item?.message ?? '');
+  const marks = [];
+  if (item?.correlation_id) marks.push(`corr=${stripControlChars(item.correlation_id)}`);
+  if (item?.reply_to) marks.push(`reply_to=${stripControlChars(item.reply_to)}`);
+  if (item?.question) marks.push('question');
+  if (Array.isArray(item?.attachments) && item.attachments.length) {
+    marks.push(`${item.attachments.length} attachment${item.attachments.length === 1 ? '' : 's'}`);
+  }
+  const suffix = marks.length ? `  (${marks.join(' · ')})` : '';
+  return `[${stripControlChars(room)}] ${body}${suffix}`;
 }
 
 async function listHandoffs(args) {
@@ -1553,6 +1680,7 @@ async function handoff(args) {
 
   const message = args.message;
   if (!message) fail('a --message is required', EXIT.USAGE);
+  requireMaxLength(message, 500, '--message');
 
   const { token, apiBase } = agentContext(args);
 
@@ -2035,6 +2163,7 @@ const CLI_SCOPES = [
   'pingroom:rooms:read',        // resolve/display the connected room
   'pingroom:broadcast:send',    // ping
   'pingroom:attachments:write', // ping --attach (the upload leg)
+  'pingroom:notifications:read',// listen
   'pingroom:questions:ask',     // ask / watch / cancel / list, and the hook
   'pingroom:handoffs:create',   // handoff / handoffs
   'pingroom:live:write',        // live start/update/end/get
@@ -2887,6 +3016,7 @@ const COMMANDS = {
   list: (rest) => list(parseQArgs(rest)),
   handoff: (rest) => handoff(parseHandoffArgs(rest)),
   handoffs: (rest) => listHandoffs(parseQArgs(rest)),
+  listen: (rest) => listen(parseQArgs(rest)),
   hook: (rest) => hook(parseHookArgs(rest)),
   mcp,
   activate: (rest) => activateStoredInbox(parseQArgs(rest)),
@@ -2930,4 +3060,13 @@ async function main() {
   process.exit(code);
 }
 
-main();
+// Anything that escapes a handler is a bug in this tool, not a usage error, but
+// the operator still gets one clean line instead of a Node stack trace — and the
+// same exit 1 every other failure uses, so scripts branching on the code are
+// unaffected. PINGROOM_DEBUG keeps the stack for whoever is fixing it.
+main().catch((error) => {
+  if (process.env.PINGROOM_DEBUG) {
+    process.stderr.write(`${error?.stack ?? error}\n`);
+  }
+  fail(`unexpected error: ${stripControlChars(error?.message ?? String(error))}`);
+});

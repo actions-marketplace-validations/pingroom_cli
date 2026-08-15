@@ -1150,9 +1150,18 @@ test('hook PreToolUse fails open to "ask" when the question expires', async () =
 test('hook PreToolUse fails open to "ask" with no token, without any request', () => {
   const event = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } };
   // No server needed: missing config must short-circuit before any network call.
+  // EMPTY_HOME for the same reason every other test uses it — this one inherits
+  // process.env directly, so without it the developer's own ~/.pingroom
+  // credential leaks in and the "no config" path is never exercised (it asks a
+  // real human a real question instead).
   const r = spawnSync(process.execPath, [CLI, 'hook'], {
     input: JSON.stringify(event),
-    env: (() => { const e = { ...process.env }; delete e.PINGROOM_TOKEN; delete e.PINGROOM_ROOM; return e; })(),
+    env: (() => {
+      const e = { ...process.env, PINGROOM_HOME: EMPTY_HOME };
+      delete e.PINGROOM_TOKEN;
+      delete e.PINGROOM_ROOM;
+      return e;
+    })(),
     encoding: 'utf8',
   });
   assert.equal(r.status, 0);
@@ -1655,6 +1664,25 @@ function pairingServer(statuses, { onRegister, ensureResponses, waitResponses } 
   }).then((s) => ({ ...s, received }));
 }
 
+/**
+ * Pair, then run `pingroom activate`, and return the activate result.
+ *
+ * Connecting no longer sends a test Question — the approval the human tapped is
+ * the round-trip — so every activation behaviour is now reached through the
+ * explicit command. Pairing first is what gives `activate` the saved
+ * QR credential (and the origin it is bound to) that it requires.
+ */
+async function pairThenActivate(home, baseUrl, env = {}, opts = {}) {
+  const paired = await runAsync(
+    ['--api', baseUrl],
+    { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
+    { stdin: '1\n' },
+  );
+  assert.equal(paired.status, 0, paired.stderr);
+
+  return runAsync(['activate', '--api', baseUrl], { PINGROOM_HOME: home, NODE_ENV: 'test', ...env }, opts);
+}
+
 const ACTIVE_PAIR = {
   status: 'active',
   credential: 'active_jwt',
@@ -1870,6 +1898,56 @@ test('bare pingroom prints the connected status and the help', () => {
   }
 });
 
+test('the status line reflects a grant wider than one room', () => {
+  const cases = [
+    {
+      cred: { room_access: 'all', room: null, rooms: [] },
+      expect: /Connected as @agt_ab12cd34ef → all rooms/,
+    },
+    {
+      cred: {
+        room_access: 'selected',
+        room: { invite_code: 'ABC123', name: 'Project X' },
+        rooms: [{ invite_code: 'ABC123', name: 'Project X' }, { invite_code: 'DEF456', name: 'Ops' }],
+      },
+      expect: /Connected as @agt_ab12cd34ef → #Project X \+1 more/,
+    },
+  ];
+
+  for (const { cred, expect } of cases) {
+    const home = newHome();
+    seedCredential(home, { token: 'stored_tok', handle: 'agt_ab12cd34ef', ...cred });
+    try {
+      const { status, stdout } = run([], { PINGROOM_HOME: home });
+      assert.equal(status, 0);
+      assert.match(stdout, expect);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test('activate explains an all-rooms grant with no delivery room instead of blaming the pairing', () => {
+  const home = newHome();
+  seedCredential(home, {
+    token: 'stored_tok',
+    handle: 'agt_ab12cd34ef',
+    room: null,
+    rooms: [],
+    room_access: 'all',
+    scopes: ['pingroom:handoffs:create'],
+    api_url: 'https://api.pingroom.io',
+  });
+  try {
+    const { status, stderr } = run(['activate'], { PINGROOM_HOME: home });
+    assert.equal(status, 2);
+    assert.match(stderr, /granted all rooms but no delivery room/);
+    assert.match(stderr, /Connected Agents/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('bare pingroom reports the env token instead of the stored credential', () => {
   const home = newHome();
   seedCredential(home, { token: 'stored_tok', handle: 'agt_ab12cd34ef' });
@@ -1922,17 +2000,14 @@ test('pairing renders a QR, polls to active, and stores a 0600 credential', asyn
     assert.match(stdout, /[█▄▀]{4}/);
     assert.match(stdout, /Or open: https:\/\/pingroom\.io\/app\/agents\/pair\?token=p{64}/);
     assert.match(stdout, /✓ Connected as @agt_ab12cd34ef → #Project X/);
-    assert.match(stdout, /Sending a test question to PingRoom/);
-    assert.match(stdout, /Test question answered \(Yes\)\. Agent Inbox is ready/);
+    // Connecting is the whole ceremony: the approval the human just tapped IS
+    // the round-trip, so nothing else is sent to their phone.
+    assert.doesNotMatch(stdout, /test question/i);
 
     const paths = received.map((r) => r.path);
     assert.equal(paths[0], '/api/agent/auth');
     assert.equal(paths[1], '/api/agent/auth/pair/start');
-    assert.deepEqual(paths.slice(2, 5), Array(3).fill('/api/agent/auth/pair/status'));
-    assert.deepEqual(paths.slice(5), [
-      '/api/agent/inbox/ensure',
-      '/api/agent/handoffs/q-onboard/wait',
-    ]);
+    assert.deepEqual(paths.slice(2), Array(3).fill('/api/agent/auth/pair/status'));
 
     // Anonymous registration, with the scopes the CLI actually uses.
     const register = JSON.parse(received[0].body);
@@ -1943,12 +2018,6 @@ test('pairing renders a QR, polls to active, and stores a 0600 credential', asyn
     assert.equal(received[1].auth, 'Bearer pre_claim_jwt');
     assert.deepEqual(JSON.parse(received[1].body).scopes, register.scopes);
     for (const poll of received.slice(2, 5)) assert.equal(poll.auth, 'Bearer pre_claim_jwt');
-
-    const ensure = received.find((r) => r.path === '/api/agent/inbox/ensure');
-    const activationWait = received.find((r) => r.path === '/api/agent/handoffs/q-onboard/wait');
-    assert.equal(ensure.auth, 'Bearer active_jwt');
-    assert.deepEqual(JSON.parse(ensure.body), {});
-    assert.equal(activationWait.auth, 'Bearer active_jwt');
 
     const credPath = join(home, 'credentials.json');
     const cred = JSON.parse(readFileSync(credPath, 'utf8'));
@@ -1967,7 +2036,7 @@ test('pairing renders a QR, polls to active, and stores a 0600 credential', asyn
   }
 });
 
-test('pairing keeps the saved connection when Agent Inbox activation cannot start', async () => {
+test('activate keeps the saved connection when Agent Inbox activation cannot start', async () => {
   const home = newHome();
   const { server, baseUrl, received } = await pairingServer([ACTIVE_PAIR], {
     ensureResponses: [{
@@ -1976,12 +2045,8 @@ test('pairing keeps the saved connection when Agent Inbox activation cannot star
     }],
   });
   try {
-    const { status, stdout, stderr } = await runAsync(
-      ['--api', baseUrl],
-      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
-      { stdin: '1\n' },
-    );
-    assert.equal(status, 0, stderr);
+    const { status, stdout, stderr } = await pairThenActivate(home, baseUrl);
+    assert.equal(status, 1, stderr);
     assert.match(stdout, /Agent Inbox activation is not complete: Choose a delivery room in PingRoom/);
     assert.match(stdout, /connection is saved and usable/);
     assert.match(stdout, /Run "pingroom activate"/);
@@ -1994,29 +2059,16 @@ test('pairing keeps the saved connection when Agent Inbox activation cannot star
   }
 });
 
-test('pingroom activate retries a failed QR activation with the saved credential', async () => {
+test('pingroom activate retries a failed activation with the saved credential', async () => {
   const home = newHome();
   const { server, baseUrl, received } = await pairingServer([ACTIVE_PAIR], {
     ensureResponses: [
-      { status: 409, body: { code: 'temporarily_unavailable', message: 'Try again shortly.' } },
       { status: 409, body: { code: 'temporarily_unavailable', message: 'Try again shortly.' } },
       activationEnsureResponse(),
     ],
   });
   try {
-    const paired = await runAsync(
-      ['--api', baseUrl],
-      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
-      { stdin: '1\n' },
-    );
-    assert.equal(paired.status, 0, paired.stderr);
-    assert.match(paired.stdout, /Run "pingroom activate"/);
-    assert.doesNotMatch(paired.stdout, /Agent Inbox is ready/);
-
-    const incomplete = await runAsync(
-      ['activate', '--api', baseUrl],
-      { PINGROOM_HOME: home },
-    );
+    const incomplete = await pairThenActivate(home, baseUrl);
     assert.equal(incomplete.status, 1, incomplete.stderr);
     assert.match(incomplete.stdout, /Run "pingroom activate"/);
     assert.doesNotMatch(incomplete.stdout, /Agent Inbox is ready/);
@@ -2030,9 +2082,10 @@ test('pingroom activate retries a failed QR activation with the saved credential
     assert.match(retried.stdout, /Agent Inbox is ready/);
 
     const ensureCalls = received.filter((request) => request.path === '/api/agent/inbox/ensure');
-    assert.equal(ensureCalls.length, 3);
+    assert.equal(ensureCalls.length, 2);
+    assert.equal(ensureCalls[0].auth, 'Bearer active_jwt');
     assert.equal(ensureCalls[1].auth, 'Bearer active_jwt');
-    assert.equal(ensureCalls[2].auth, 'Bearer active_jwt');
+    assert.deepEqual(JSON.parse(ensureCalls[0].body), {});
     assert.equal(received.filter((request) => request.path === '/api/agent/handoffs/q-onboard/wait').length, 1);
     assert.equal(received.filter((request) => request.path === '/api/agent/auth').length, 1);
     assert.equal(JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8')).token, 'active_jwt');
@@ -2104,7 +2157,7 @@ test('pingroom activate rejects non-QR or under-scoped saved credentials before 
   }
 });
 
-test('pairing does not claim readiness when an answer lacks confirmed activation', async () => {
+test('activate does not claim readiness when an answer lacks confirmed activation', async () => {
   for (const completion of [false, 'missing']) {
     const home = newHome();
     const terminal = {
@@ -2121,18 +2174,13 @@ test('pairing does not claim readiness when an answer lacks confirmed activation
       waitResponses: [{ status: 200, body: terminal }],
     });
     try {
-      const { status, stdout, stderr } = await runAsync(
-        ['--api', baseUrl],
-        {
-          PINGROOM_HOME: home,
-          PINGROOM_INTERNAL_TEST_TTY: '1',
-          PINGROOM_INTERNAL_ACTIVATION_TIMEOUT_MS: '2600',
-          NODE_ENV: 'test',
-          COLUMNS: '120',
-        },
-        { stdin: '1\n', timeoutMs: 7_000 },
+      const { status, stdout, stderr } = await pairThenActivate(
+        home,
+        baseUrl,
+        { PINGROOM_INTERNAL_ACTIVATION_TIMEOUT_MS: '2600' },
+        { timeoutMs: 7_000 },
       );
-      assert.equal(status, 0, stderr);
+      assert.equal(status, 1, stderr);
       assert.match(stdout, /answered without verified phone receipt before the answer/);
       assert.match(stdout, /connection is saved and usable/);
       assert.match(stdout, /run "pingroom activate" to send a fresh test with this saved connection/i);
@@ -2147,7 +2195,7 @@ test('pairing does not claim readiness when an answer lacks confirmed activation
   }
 });
 
-test('pairing rejects malformed or mismatched activation envelopes without losing credentials', async () => {
+test('activate rejects malformed or mismatched activation envelopes without losing credentials', async () => {
   const invalidCases = [
     {
       ensureResponses: [{
@@ -2187,12 +2235,8 @@ test('pairing rejects malformed or mismatched activation envelopes without losin
     const home = newHome();
     const { server, baseUrl } = await pairingServer([ACTIVE_PAIR], invalid);
     try {
-      const { status, stdout, stderr } = await runAsync(
-        ['--api', baseUrl],
-        { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
-        { stdin: '1\n' },
-      );
-      assert.equal(status, 0, stderr);
+      const { status, stdout, stderr } = await pairThenActivate(home, baseUrl);
+      assert.equal(status, 1, stderr);
       assert.match(stdout, invalid.expected);
       assert.match(stdout, /connection is saved and usable/);
       assert.match(stdout, /Run "pingroom activate"/);
@@ -2205,7 +2249,7 @@ test('pairing rejects malformed or mismatched activation envelopes without losin
   }
 });
 
-test('pairing honors Retry-After for ensure and wait 429s, then completes activation', async () => {
+test('activate honors Retry-After for ensure and wait 429s, then completes activation', async () => {
   const home = newHome();
   const successEnsure = activationEnsureResponse();
   const { server, baseUrl, received } = await pairingServer([ACTIVE_PAIR], {
@@ -2227,11 +2271,19 @@ test('pairing honors Retry-After for ensure and wait 429s, then completes activa
     ],
   });
   try {
-    const startedAt = Date.now();
-    const { status, stdout, stderr } = await runAsync(
+    // Pair first (untimed), then measure only the activation round trip.
+    const paired = await runAsync(
       ['--api', baseUrl],
       { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
-      { stdin: '1\n', timeoutMs: 8000 },
+      { stdin: '1\n' },
+    );
+    assert.equal(paired.status, 0, paired.stderr);
+
+    const startedAt = Date.now();
+    const { status, stdout, stderr } = await runAsync(
+      ['activate', '--api', baseUrl],
+      { PINGROOM_HOME: home, NODE_ENV: 'test' },
+      { timeoutMs: 8000 },
     );
     assert.equal(status, 0, stderr);
     const elapsed = Date.now() - startedAt;
@@ -2251,24 +2303,19 @@ test('pairing honors Retry-After for ensure and wait 429s, then completes activa
   }
 });
 
-test('pairing stops at the activation deadline without discarding credentials', async () => {
+test('activate stops at the activation deadline without discarding credentials', async () => {
   const home = newHome();
   const { server, baseUrl, received } = await pairingServer([ACTIVE_PAIR], {
     waitResponses: [{ status: 200, body: { id: 'q-onboard', kind: 'question', state: 'pending' } }],
   });
   try {
-    const { status, stdout, stderr } = await runAsync(
-      ['--api', baseUrl],
-      {
-        PINGROOM_HOME: home,
-        PINGROOM_INTERNAL_TEST_TTY: '1',
-        PINGROOM_INTERNAL_ACTIVATION_TIMEOUT_MS: '100',
-        NODE_ENV: 'test',
-        COLUMNS: '120',
-      },
-      { stdin: '1\n', timeoutMs: 3000 },
+    const { status, stdout, stderr } = await pairThenActivate(
+      home,
+      baseUrl,
+      { PINGROOM_INTERNAL_ACTIVATION_TIMEOUT_MS: '100' },
+      { timeoutMs: 3000 },
     );
-    assert.equal(status, 0, stderr);
+    assert.equal(status, 1, stderr);
     assert.match(stdout, /still waiting for the test answer/);
     assert.match(stdout, /connection is saved and usable/);
     assert.match(stdout, /Run "pingroom activate"/);
@@ -2427,7 +2474,10 @@ test('help documents the credential store, the precedence, and the absence of a 
   assert.match(stdout, /explicit flag\s+>\s+env var\s+>\s+~\/\.pingroom\/config\.json\s+>\s+the paired\s+credential\s+>\s+built-in default/);
   assert.match(stdout, /There is no "login" command/);
   assert.match(stdout, /^  activate /m);
-  assert.match(stdout, /Run "pingroom activate" to retry/);
+  // Connecting sends nothing to the phone, and the help has to say so — the
+  // optional test Question is what "activate" is for.
+  assert.match(stdout, /connecting sends nothing to your phone/);
+  assert.match(stdout, /Run "pingroom activate" if you want to prove the round-trip/);
   assert.match(stdout, /^  config   /m);
   assert.match(stdout, /^  logout   /m);
   assert.match(stdout, /stored credential is bound to the origin it was paired\s+against/);

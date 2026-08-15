@@ -26,8 +26,10 @@ npx --yes @pingroom/cli
 ```
 
 Either command starts the same connection prompt. QR pairing stores the selected
-account, credential, and delivery room in `~/.pingroom`; later commands reuse
+account, credential, and room grant in `~/.pingroom`; later commands reuse
 them, so a local invocation needs neither `PINGROOM_TOKEN` nor `PINGROOM_ROOM`.
+On the phone you grant one room, several, or every room on the account — the
+first room you pick is the delivery room, where Questions and Handoffs land.
 The email fallback stores the credential only. Setting
 `pingroom config set default_room <invite-code>` enables room-addressed commands,
 but private Agent Inbox and Handoff delivery require a connection approved with
@@ -41,15 +43,15 @@ pingroom ping -m "Deploy succeeded ✅"
 Commands: `ping` (send), `ask` (ask a human), `watch` (block on an existing
 question), `list`, `cancel`, `handoff` (hand a decision to a specific human),
 `handoffs` (list open or recent Handoffs), `live` (lock-screen progress card),
-`hook` (Claude Code), `mcp` (client setup), `activate` (retry the Agent Inbox
-test), `config`, and `logout`.
+`hook` (Claude Code), `mcp` (client setup), `activate` (send an optional test
+Question), `config`, and `logout`.
 Run `pingroom --help` for the full reference.
 
 ## Connecting
 
 Run `pingroom` (global install) or `npx --yes @pingroom/cli` (no install) with no
-arguments. It prints a QR code — scan it with the PingRoom app and pick both the
-account and the room the agent delivers to — or take the emailed-code fallback.
+arguments. It prints a QR code — scan it with the PingRoom app, pick the account,
+and grant the rooms this agent may reach — or take the emailed-code fallback.
 
 ```
 $ pingroom
@@ -60,38 +62,34 @@ $ pingroom
 
   [QR]
   Or open: https://pingroom.io/app/agents/pair?token=…
-  Waiting for approval… ✓ Connected as @agt_ab12cd34ef → #Project X
-  Sending a test question to PingRoom…
-  Answer “PingRoom connected. Can you answer this?” on your phone.
-✓ Test question answered (Yes). Agent Inbox is ready.
+  Waiting for approval… ✓ Connected as @agt_ab12cd34ef → #Project X +2 more
 ```
 
-After QR approval, the CLI saves the active credential first, then sends one
-idempotent onboarding Question and observes it through the Handoff wait API.
-Short network and server failures are retried, and `Retry-After` is honored for
-rate limits within the two-minute overall deadline. An answer alone is not
-reported as success: the terminal response must also carry the server's exact
-`activation_completed: true` stamp. On supporting server and mobile builds,
-that stamp means the native phone returned the opaque proof carried in the push
-before the human answer, and this CLI then observed the result. An answered
-response whose stamp is false or missing is incomplete and is not retried as if
-history could be rewritten. If the Question is still pending when the local
-deadline elapses, or activation cannot start, the CLI prints the recovery
-command and exits with the connection still saved and usable. A terminal test
-without the stamp requires a current PingRoom app and a fresh numbered attempt;
-run `pingroom activate` again with the saved connection.
+Approving on the phone is the whole ceremony — connecting sends nothing else to
+your phone. The status line reflects the grant: `→ #Project X` for one room,
+`→ #Project X +2 more` for several, `→ all rooms` when you granted every room.
 
-Resume an open idempotent check with the saved QR credential:
+## Proving the round-trip (optional)
 
 ```bash
 pingroom activate
 ```
 
-An incomplete explicit retry exits `1`; it never deletes or replaces the saved
-credential. The command does not fall back to `PINGROOM_TOKEN`, an email-only
-credential, or a credential without `pingroom:handoffs:create` and a
-QR-selected delivery room. Email-code and other non-interactive credential
-flows do not run the phone-response loop automatically.
+`activate` sends one idempotent onboarding Question and observes it through the
+Handoff wait API. Short network and server failures are retried, and
+`Retry-After` is honored for rate limits within the two-minute overall deadline.
+An answer alone is not reported as success: the terminal response must also
+carry the server's exact `activation_completed: true` stamp. On supporting
+server and mobile builds, that stamp means the native phone returned the opaque
+proof carried in the push before the human answer, and this CLI then observed
+the result. An answered response whose stamp is false or missing is incomplete
+and is not retried as if history could be rewritten.
+
+An incomplete run exits `1`; it never deletes or replaces the saved credential.
+The command does not fall back to `PINGROOM_TOKEN`, an email-only credential, or
+a credential without `pingroom:handoffs:create` and a delivery room. A grant of
+all rooms pins no delivery room — pick one under Connected Agents in the app
+first.
 
 There is deliberately no `login` command: being unconnected is a state the tool
 resolves, not one you have to discover. Once connected, bare `pingroom` prints

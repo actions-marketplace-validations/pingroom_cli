@@ -22,7 +22,7 @@
 //   live     Drive a live progress card (iOS Live Activity / Android live
 //            update) on the room members' lock screen: start / update / end.
 //   mcp      Print the canonical remote MCP endpoint and client setup snippets.
-//   activate Retry Agent Inbox activation with the saved QR-paired credential.
+//   activate Send one optional test Question with the saved QR-paired credential.
 //   config   Read/write ~/.pingroom/config.json (default_room, api_url).
 //   logout   Forget the credential in ~/.pingroom/credentials.json.
 //
@@ -165,8 +165,9 @@ mcp:
                                    (output-only; does not change client config)
 
 activate:
-  pingroom activate                Replay or create the next Agent Inbox test using
-                                   the saved QR-paired credential
+  pingroom activate                Send one test Question to your phone to prove the
+                                   saved QR-paired credential works (optional —
+                                   connecting no longer does this for you)
 
 config options:
   pingroom config list              Print the stored settings
@@ -190,11 +191,10 @@ Connecting:
     npx --yes @pingroom/cli
 
   It prints a QR code you scan with the PingRoom app — you pick the account and
-  delivery room there. Once paired, it saves the credential, sends one test
-  Question, and waits briefly for the server to confirm the completed phone
-  round-trip; an answer alone is not treated as activation, and a setup problem
-  never discards the usable connection. Run "pingroom activate" to retry that
-  test later. The emailed-code fallback stores no server-side delivery room.
+  the rooms it may reach there (one, several, or all of them). Once paired, it
+  saves the credential and you are done; connecting sends nothing to your phone.
+  Run "pingroom activate" if you want to prove the round-trip with one test
+  Question. The emailed-code fallback stores no server-side delivery room.
   "config set default_room" enables room-addressed commands, but private
   Inbox/Handoff delivery requires QR pairing.
   There is no "login" command: being unconnected is a state the tool resolves,
@@ -1989,7 +1989,9 @@ const CLI_SCOPES = [
   'pingroom:live:write',        // live start/update/end/get
 ];
 
-const AGENT_LABEL = 'pingroom-cli';
+// What the human reads on the approval screen. A product name, not a package
+// id: the phone shows it verbatim ("PingRoom CLI wants to connect").
+const AGENT_LABEL = 'PingRoom CLI';
 // A connect command should prove the phone round-trip, but it must not hold a
 // terminal for the onboarding Question's full 24-hour server TTL. The Question
 // remains answerable after this local deadline and the credential is already
@@ -2124,12 +2126,17 @@ async function registerAnonymous(apiBase) {
 }
 
 /** Persist the active credential plus the bits the status line prints. */
-function saveCredential({ token, handle, room, account, scopes, apiBase }) {
+function saveCredential({ token, handle, room, rooms, roomAccess, account, scopes, apiBase }) {
   writeJsonFile(credentialsPath(), {
     version: 1,
     token,
     handle: handle || null,
+    // `room` is the delivery room — where handoffs and questions land. `rooms`
+    // is the whole grant, which can be wider; `room_access: "all"` means the
+    // human granted every room they are in, listing none.
     room: room || null,
+    rooms: Array.isArray(rooms) ? rooms : [],
+    room_access: roomAccess || null,
     account: account || null,
     scopes: scopes || [],
     api_url: apiBase,
@@ -2137,11 +2144,22 @@ function saveCredential({ token, handle, room, account, scopes, apiBase }) {
   });
 }
 
-/** "✓ Connected as @agt_ab12 → #Project X" — the room half is omitted if unknown. */
+/**
+ * "✓ Connected as @agt_ab12 → #Project X" — the room half is omitted if unknown,
+ * and widened to "→ all rooms" / "→ #Project X +2 more" when the human granted
+ * this agent more than the one delivery room.
+ */
 function connectedLine(cred) {
   const who = cred.handle ? `@${cred.handle}` : 'this machine';
   const room = cred.room && (cred.room.name || cred.room.invite_code);
-  return `✓ Connected as ${who}${room ? ` → #${room}` : ''}`;
+  const access = cred.room_access ?? cred.roomAccess;
+
+  if (access === 'all') return `✓ Connected as ${who} → all rooms`;
+
+  if (!room) return `✓ Connected as ${who}`;
+
+  const extra = Math.max(0, (Array.isArray(cred.rooms) ? cred.rooms.length : 0) - 1);
+  return `✓ Connected as ${who} → #${room}${extra > 0 ? ` +${extra} more` : ''}`;
 }
 
 function activationFailureDetail(result) {
@@ -2391,7 +2409,15 @@ async function activateStoredInbox(args) {
     fail('no saved QR-paired credential; run "pingroom" in an interactive terminal first', EXIT.USAGE);
   }
   if (!credential.room || !isNonEmptyString(credential.room.invite_code)) {
-    fail('the saved credential has no QR-selected delivery room; reconnect with QR pairing before running "pingroom activate"', EXIT.USAGE);
+    // Granting every room is a valid answer that pins no destination, so the
+    // fix there is picking one — not pairing again, which would only offer the
+    // same choice back.
+    fail(
+      credential.room_access === 'all'
+        ? 'this agent was granted all rooms but no delivery room; pick one in the PingRoom app under Connected Agents, then run "pingroom activate" again'
+        : 'the saved credential has no QR-selected delivery room; reconnect with QR pairing before running "pingroom activate"',
+      EXIT.USAGE,
+    );
   }
   if (!Array.isArray(credential.scopes) || !credential.scopes.includes('pingroom:handoffs:create')) {
     fail('the saved credential lacks pingroom:handoffs:create; reconnect with QR pairing before running "pingroom activate"', EXIT.USAGE);
@@ -2516,13 +2542,19 @@ async function connectByPairing(apiBase, ask) {
           token: json.credential,
           handle: json.handle,
           room: json.room,
+          rooms: Array.isArray(json.rooms) ? json.rooms : [],
+          roomAccess: typeof json.room_access === 'string' ? json.room_access : null,
           account: json.account,
           scopes: json.scopes,
           apiBase,
         };
         saveCredential(cred);
         process.stdout.write(`${connectedLine(cred)}\n`);
-        await activateInboxAfterPairing(cred);
+        // Connecting deliberately sends nothing to the human's phone. The
+        // approval they just tapped IS the round-trip; a test Question on top of
+        // it was one more thing to answer before the tool could be used, and it
+        // made a healthy connection look broken whenever the answer was slow.
+        // `pingroom activate` still sends one for anyone who wants the proof.
         return cred;
       }
       if (status === 'expired') break;

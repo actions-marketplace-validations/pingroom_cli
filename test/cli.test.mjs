@@ -43,20 +43,20 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.7\.0/);
+  assert.match(action, /@pingroom\/cli@0\.7\.1/);
 });
 
 test('source versions align while the GitHub Action stays on the published release', () => {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.7.0');
+  assert.equal(pkg.version, '0.7.1');
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   // The Action must pin the concrete, clean-install-verified npm release, never
   // a range or `latest`.
   const pinned = action.match(/@pingroom\/cli@(\d+\.\d+\.\d+)/)?.[1];
-  assert.equal(pinned, '0.7.0');
+  assert.equal(pinned, '0.7.1');
 });
 
 /**
@@ -1017,7 +1017,7 @@ test('hook --print-config prints a pasteable settings.json with the pinned versi
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.7\.0 hook/);
+  assert.match(stdout, /npx --yes @pingroom\/cli@0\.7\.1 hook/);
   assert.match(stdout, /stored credential and paired room automatically/);
   assert.doesNotMatch(stdout, /^#\s+export PINGROOM_TOKEN/m);
 });

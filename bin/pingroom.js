@@ -41,7 +41,7 @@ import { join } from 'node:path';
 // Kept in lockstep with package.json / package-lock.json. The GitHub Action is
 // pinned independently to the latest version already published on npm; a test
 // makes that release gate explicit. `hook --print-config` emits this candidate.
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 
 const BUILTIN_API = 'https://api.pingroom.io';
 const MCP_ENDPOINT = `${BUILTIN_API}/api/agent/mcp`;
@@ -319,8 +319,11 @@ const API_HINTS = {
  * thing that would fix it when we know one.
  */
 function apiDetail(res, json) {
-  const base =
-    (json && (json.message || json.error || json.code)) || `HTTP ${res ? res.status : 'error'}`;
+  // The server's wording is untrusted text headed for the terminal — strip
+  // escapes so a hostile API can't smuggle ANSI (same threat model as pair_url).
+  const base = stripControlChars(
+    (json && (json.message || json.error || json.code)) || `HTTP ${res ? res.status : 'error'}`,
+  );
   const hint = json && typeof json.code === 'string' ? API_HINTS[json.code] : undefined;
   return hint ? `${base}\n  ${hint}` : base;
 }
@@ -512,6 +515,19 @@ function requireMaxLength(value, max, flag) {
   if (typeof value === 'string' && value.length > max) {
     fail(`${flag} must be at most ${max} characters (got ${value.length})`, EXIT.USAGE);
   }
+}
+
+/**
+ * Validate --timeout and resolve the per-poll hold. Called by ask/handoff
+ * BEFORE the create POST: the old in-wait check ran only after the question or
+ * handoff already existed, so `--timeout -5` put a live question on someone's
+ * phone and then exited 2, orphaning it until its TTL.
+ */
+function resolveWaitHold(args, { def, cap }) {
+  if (args.timeout === undefined) return Math.min(def, cap);
+  const hold = Number(args.timeout);
+  if (!Number.isFinite(hold) || hold < 0) fail('--timeout must be a non-negative integer', EXIT.USAGE);
+  return Math.min(hold, cap);
 }
 
 function stripControlChars(value) {
@@ -1317,11 +1333,10 @@ function printResolution(q) {
 // and return the state's exit code. The server expires it at its ttl, so this
 // always terminates.
 async function waitForResolution(id, args, { token, apiBase }) {
-  let hold = args.timeout !== undefined ? Number(args.timeout) : 25;
-  if (!Number.isFinite(hold) || hold < 0) fail('--timeout must be a non-negative integer', EXIT.USAGE);
-  hold = Math.min(hold, 30);
+  const hold = resolveWaitHold(args, { def: 25, cap: 30 });
 
   for (;;) {
+    const started = Date.now();
     const url = `${apiBase}/api/agent/questions/${encodeURIComponent(id)}/wait?timeout=${hold}`;
     const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) {
@@ -1333,7 +1348,11 @@ async function waitForResolution(id, args, { token, apiBase }) {
       else printResolution(json);
       return exitForState(json.state);
     }
-    // Still pending at the hold timeout — poll again.
+    // Still pending at the hold timeout — poll again, but never hot-loop: a
+    // misbehaving server that answers `pending` instantly (ignoring the hold)
+    // would otherwise be hammered at full speed.
+    const elapsed = Date.now() - started;
+    if (elapsed < 1000) await sleep(1000 - elapsed);
   }
 }
 
@@ -1375,6 +1394,9 @@ async function ask(args) {
     body.text_input = textInput;
   }
   if (args.data !== undefined) body.data = parseDataObject(args.data);
+
+  // Pre-flight: reject a bad --timeout before the question exists.
+  if (args.wait) resolveWaitHold(args, { def: 25, cap: 30 });
 
   const url = `${apiBase}/api/agent/rooms/${encodeURIComponent(room)}/questions`;
   const { res, text, json } = await httpJson('POST', url, { body, headers: { Authorization: `Bearer ${token}` } });
@@ -1648,11 +1670,10 @@ function writeGitHubHandoffOutputs(path, h) {
 // Long-poll GET /handoffs/{id}/wait until the handoff leaves open/pending, then
 // print it and return the state's exit code. Reuses the shared bounded hold.
 async function waitForHandoff(id, args, { token, apiBase }, initialDeliveryState) {
-  let hold = args.timeout !== undefined ? Number(args.timeout) : 20;
-  if (!Number.isFinite(hold) || hold < 0) fail('--timeout must be a non-negative integer', EXIT.USAGE);
-  hold = Math.min(hold, 25);
+  const hold = resolveWaitHold(args, { def: 20, cap: 25 });
 
   for (;;) {
+    const started = Date.now();
     const url = `${apiBase}/api/agent/handoffs/${encodeURIComponent(id)}/wait?timeout=${hold}`;
     const { res, text, json } = await httpJson('GET', url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) {
@@ -1671,7 +1692,10 @@ async function waitForHandoff(id, args, { token, apiBase }, initialDeliveryState
       else printHandoff(resolved);
       return exitForHandoffState(resolved.state);
     }
-    // Still open/pending at the hold timeout — poll again.
+    // Still open/pending at the hold timeout — poll again, with the same
+    // hot-loop floor as waitForResolution.
+    const elapsed = Date.now() - started;
+    if (elapsed < 1000) await sleep(1000 - elapsed);
   }
 }
 
@@ -1725,6 +1749,9 @@ async function handoff(args) {
     if (!args.idempotency_key) fail('--idempotency-key must be non-empty', EXIT.USAGE);
     headers['Idempotency-Key'] = args.idempotency_key;
   }
+
+  // Pre-flight: reject a bad --timeout before the handoff exists.
+  if (args.wait) resolveWaitHold(args, { def: 20, cap: 25 });
 
   const url = `${apiBase}/api/agent/handoffs`;
   const { res, text, json } = await httpJson('POST', url, { body, headers });

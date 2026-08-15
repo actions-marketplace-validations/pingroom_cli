@@ -3293,3 +3293,34 @@ test('a refusal the operator can fix carries the fix, not just the code', async 
     }
   }
 });
+
+test('live accepts "decision" — the name the app shows — and sends the wire id', async () => {
+  for (const typed of ['decision', 'question']) {
+    const { server, baseUrl, received } = await questionServer({
+      'POST /api/agent/rooms/ab12cd/live': () => ({ status: 201, body: { state: 'running' } }),
+    });
+    try {
+      const { status } = await runAsync([
+        'live', 'start', '-c', 'deploy-1', '--template', typed,
+        '--prompt', 'Ship it?', '--option', 'yes:Ship', '--option', 'no:Hold',
+        '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      ]);
+      assert.equal(status, 0);
+      // The template was renamed for people, not on the wire: the API and the
+      // Lock Screen still speak `question`, so both spellings must arrive as it.
+      assert.equal(JSON.parse(received[0].body).live_status.template, 'question');
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test('an unknown template names the alias, not the wire id, in the usage error', async () => {
+  const { status, stderr } = await runAsync([
+    'live', 'start', '-c', 'x', '--template', 'nope',
+    '--token', 'tok', '--room', 'ab12cd', '--api', 'https://api.pingroom.io',
+  ]);
+  assert.equal(status, 2);
+  assert.match(stderr, /decision/);
+  assert.doesNotMatch(stderr, /question/);
+});

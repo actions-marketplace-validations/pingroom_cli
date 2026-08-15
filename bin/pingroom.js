@@ -127,7 +127,9 @@ handoffs options (agent token required; consent scope pingroom:handoffs:create):
 live <start|update|end|get> options (agent token, or a room webhook):
   -c, --correlation-id <id>  The stream key — reuse it for every ping (required)
       --template <name>      start only: status | steps | progress | metrics |
-                             countdown | question | matchup (fixed at creation)
+                             countdown | decision | matchup (fixed at creation;
+                             'decision' is the app's name for the wire id
+                             'question', which is still accepted)
       --category <name>      start only: status | steps | alert. Legacy, but
                              'alert' has no template equivalent and is the only
                              way to start time-sensitive without --require-ack
@@ -138,8 +140,8 @@ live <start|update|end|get> options (agent token, or a room webhook):
       --metric <label:value> Repeatable, up to 3 (metrics template)
       --deadline-at <epoch>  Countdown target (countdown template)
       --eta-at <epoch>       Live ETA (status/progress templates)
-      --prompt <text>        The ask (question template)
-      --option <value:label> Repeatable, up to 4 (question template). A bare
+      --prompt <text>        The ask (decision template)
+      --option <value:label> Repeatable, up to 4 (decision template). A bare
                              token is both value and label
       --left <label:value>   Left side (matchup template)
       --right <label:value>  Right side (matchup template)
@@ -932,6 +934,26 @@ async function ping(args) {
 // --template line in HELP and with LIVE_ACTIVITY_TEMPLATES.md.
 const LIVE_TEMPLATES = ['status', 'steps', 'progress', 'metrics', 'countdown', 'question', 'matchup'];
 
+/**
+ * Names the API does not take, folded onto the wire id it does.
+ *
+ * The `question` template is labelled **Decision** everywhere a person sees it,
+ * so it is never confused with PingRoom's first-class Question protocol — that
+ * one is answered through `pingroom ask`, carries a real Question id, and this
+ * template does not. The wire id stayed `question`, so someone who reads
+ * "Decision" in the app and types it would otherwise get a usage error for
+ * using the only name they have been shown.
+ */
+const LIVE_TEMPLATE_ALIASES = { decision: 'question' };
+
+/** The wire id for a template name a human typed, or the name unchanged. */
+function canonicalTemplate(name) {
+  return LIVE_TEMPLATE_ALIASES[name] ?? name;
+}
+
+/** What we offer in help and errors: the alias leads, since it is what the app shows. */
+const LIVE_TEMPLATE_NAMES = ['status', 'steps', 'progress', 'metrics', 'countdown', 'decision', 'matchup'];
+
 // Parser for `live`: a leading subcommand (start|update|end|get) plus the
 // live-status flags. Unknown flags fail like the other parsers.
 function parseLiveArgs(argv) {
@@ -1122,10 +1144,11 @@ async function live(args) {
     // usage error, and letting it reach the server turns it into a 422 round
     // trip that reads like an outage.
     if (args.template) {
-      if (!LIVE_TEMPLATES.includes(args.template)) {
-        fail(`--template must be one of: ${LIVE_TEMPLATES.join(', ')}`, EXIT.USAGE);
+      const template = canonicalTemplate(args.template);
+      if (!LIVE_TEMPLATES.includes(template)) {
+        fail(`--template must be one of: ${LIVE_TEMPLATE_NAMES.join(', ')}`, EXIT.USAGE);
       }
-      liveStatus.template = args.template;
+      liveStatus.template = template;
     }
     // `alert` has no template equivalent and is the only way to start a stream
     // time-sensitive (breaking through Focus) without also demanding an ack.

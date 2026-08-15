@@ -225,7 +225,9 @@ pingroom live <start|update|end|get> [options]
 
   -c, --correlation-id <id>  The stream key — reuse it for every ping (required)
       --template <name>      start only: status | steps | progress | metrics |
-                             countdown | question | matchup (fixed at creation)
+                             countdown | decision | matchup (fixed at creation;
+                             'decision' is the app's name for the wire id
+                             'question', which is still accepted)
       --steps <a,b,c>        start only: 2-8 comma-separated step labels
   -m, --message <text>       The card's live message line
       --progress <0..1>      Progress bar / Dynamic Island gauge
@@ -233,8 +235,8 @@ pingroom live <start|update|end|get> [options]
       --metric <label:value> Repeatable, up to 3 (metrics template)
       --deadline-at <epoch>  Countdown target (countdown template)
       --eta-at <epoch>       Live ETA (status/progress templates)
-      --prompt <text>        The ask (question template)
-      --option <value:label> Repeatable, up to 4 (question template)
+      --prompt <text>        The ask (decision template)
+      --option <value:label> Repeatable, up to 4 (decision template)
       --left <label:value>   Left side (matchup template)
       --right <label:value>  Right side (matchup template)
       --center <text>        Center score/clock, <= 40 (matchup template)

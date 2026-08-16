@@ -106,8 +106,9 @@ Approving on the phone grants two separate things, and both are enforced:
   `handoffs:create`, `live:write`. Nothing widens them later; a command needing
   one you did not approve returns `403 insufficient_scope`.
 - **Rooms** — one room, several, or all of them. A room outside that grant
-  returns `403 room_not_granted` on any write, including pings, questions and
-  live streams. Widen it under Connected Agents in the app.
+  returns `403 room_not_granted` on every room-scoped call — writes such as
+  pings, questions and live streams, and reads such as listing a room's quick
+  actions or webhooks. Widen it under Connected Agents in the app.
 
 Both refusals print the fix, not just the code. A credential paired by an older
 CLI carries the scope set that version asked for — reconnect to re-approve if a

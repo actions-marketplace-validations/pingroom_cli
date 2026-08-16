@@ -49,7 +49,7 @@ inputs:
     required: false
     default: 'false'
   options:
-    description: 'For a question handoff: newline- or comma-separated value:label options, e.g. "deploy:Deploy\nhold:Hold". Between 2 and 4.'
+    description: 'Answer options as value:label, one per line (preferred), e.g. "deploy:Deploy\nhold:Hold". A single-line value still splits on commas, so a label containing a comma MUST use the newline form. Between 2 and 4.'
     required: false
   target:
     description: 'For a handoff: recipient — "me" (default) or a specific user uuid.'
@@ -73,19 +73,35 @@ inputs:
     description: 'For a handoff: block until acked / answered / expired / cancelled.'
     required: false
     default: 'false'
+  ask:
+    description: 'Ask a room question instead of sending a ping (requires `token` and `room`). With `wait`, blocks until it is answered.'
+    required: false
+    default: 'false'
+  context:
+    description: 'For an ask: secondary line under the prompt, e.g. a build number (<= 40 chars).'
+    required: false
+  timeout:
+    description: 'For an ask with `wait`: per long-poll hold in seconds (0-30, default 25).'
+    required: false
+  api:
+    description: 'API base URL override (self-hosted or staging). Passed as PINGROOM_API_URL, so it applies to every mode.'
+    required: false
 
 outputs:
   handoff-id:
     description: 'The id of the created handoff (handoff mode only).'
     value: ${{ steps.pingroom.outputs.handoff-id }}
+  question-id:
+    description: 'The id of the created question (ask mode only).'
+    value: ${{ steps.pingroom.outputs.question-id }}
   state:
-    description: 'Terminal handoff state: acked | answered | expired | cancelled (or open/pending without wait).'
+    description: 'Terminal handoff or question state: acked | answered | expired | cancelled (or open/pending without wait).'
     value: ${{ steps.pingroom.outputs.state }}
   acknowledged-by:
     description: 'The user id that acknowledged an ack handoff.'
     value: ${{ steps.pingroom.outputs.acknowledged-by }}
   answer:
-    description: 'The chosen value of an answered question handoff (any value, including a negative one).'
+    description: 'The chosen value of an answered question — handoff or ask (any value, including a negative one).'
     value: ${{ steps.pingroom.outputs.answer }}
   delivery-state:
     description: 'Initial delivery state of the handoff: enqueued | pending | failed.'
@@ -100,6 +116,10 @@ runs:
         # Secrets are mapped to env, never echoed to the log.
         PINGROOM_WEBHOOK_URL: ${{ inputs.webhook-url }}
         PINGROOM_TOKEN: ${{ inputs.token }}
+        # An API override belongs in the environment, not on the command line:
+        # the CLI already resolves PINGROOM_API_URL for every command, so one
+        # env var covers ping, ask and handoff with no per-branch flag.
+        PINGROOM_API_URL: ${{ inputs.api }}
         PR_MESSAGE: ${{ inputs.message }}
         PR_TITLE: ${{ inputs.title }}
         PR_ACTION: ${{ inputs.action }}
@@ -119,21 +139,41 @@ runs:
         PR_CORRELATION_ID: ${{ inputs.correlation-id }}
         PR_REPLY_TO: ${{ inputs.reply-to }}
         PR_WAIT: ${{ inputs.wait }}
+        PR_ASK: ${{ inputs.ask }}
+        PR_CONTEXT: ${{ inputs.context }}
+        PR_TIMEOUT: ${{ inputs.timeout }}
       run: |
         set -o pipefail
         # Release gate: keep the Action on an npm-published version. Advance
         # this independently only after the matching CLI package is public.
         CLI="npx --yes @pingroom/cli@0.7.2"
 
+        # Split an options input into the PR_OPTS array, one value:label spec per
+        # element. Newline-primary: if the input contains ANY newline, newlines
+        # are the only separator, so a label may itself contain commas
+        # ("ship:Ship it, now"). A single-line input still splits on commas for
+        # backward compatibility — which is why a comma-bearing label must be
+        # written one-per-line.
+        split_options() {
+          PR_OPTS=()
+          local raw="$1" src opt
+          if [ "${raw#*$'\n'}" != "$raw" ]; then
+            src="$raw"
+          else
+            src="$(printf '%s' "$raw" | tr ',' '\n')"
+          fi
+          while IFS= read -r opt; do
+            opt="$(printf '%s' "$opt" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -n "$opt" ] && PR_OPTS+=("$opt")
+          done <<< "$src"
+        }
+
         if [ "$PR_HANDOFF" = "true" ]; then
           args=(handoff -m "$PR_MESSAGE")
           [ "$PR_QUESTION" = "true" ] && args+=(--question)
           if [ -n "$PR_OPTIONS" ]; then
-            # Split options on newlines or commas; each is a value:label spec.
-            while IFS= read -r opt; do
-              opt="$(printf '%s' "$opt" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-              [ -n "$opt" ] && args+=(-o "$opt")
-            done < <(printf '%s' "$PR_OPTIONS" | tr ',' '\n')
+            split_options "$PR_OPTIONS"
+            for opt in "${PR_OPTS[@]}"; do args+=(-o "$opt"); done
           fi
           [ -n "$PR_TARGET" ]          && args+=(--target "$PR_TARGET")
           [ -n "$PR_EXPIRES_IN" ]      && args+=(--expires-in "$PR_EXPIRES_IN")
@@ -147,6 +187,29 @@ runs:
           # The CLI writes only its fixed output allowlist using GitHub's
           # random-delimiter multiline protocol. Never parse untrusted answer
           # text from stdout into $GITHUB_OUTPUT.
+          set +e
+          $CLI "${args[@]}" --github-output "$GITHUB_OUTPUT"
+          code=$?
+          set -e
+          exit $code
+        fi
+
+        if [ "$PR_ASK" = "true" ]; then
+          args=(ask -p "$PR_MESSAGE" --room "$PR_ROOM")
+          if [ -n "$PR_OPTIONS" ]; then
+            split_options "$PR_OPTIONS"
+            for opt in "${PR_OPTS[@]}"; do args+=(-o "$opt"); done
+          fi
+          [ -n "$PR_CONTEXT" ]        && args+=(-c "$PR_CONTEXT")
+          [ -n "$PR_TARGET" ]         && args+=(--target "$PR_TARGET")
+          [ -n "$PR_CORRELATION_ID" ] && args+=(--correlation-id "$PR_CORRELATION_ID")
+          [ -n "$PR_REPLY_TO" ]       && args+=(--reply-to "$PR_REPLY_TO")
+          [ -n "$PR_DATA" ]           && args+=(-d "$PR_DATA")
+          [ -n "$PR_TIMEOUT" ]        && args+=(--timeout "$PR_TIMEOUT")
+          [ "$PR_WAIT" = "true" ]     && args+=(--wait)
+
+          # Same posture as the handoff branch: the CLI owns $GITHUB_OUTPUT and
+          # writes a fixed allowlist through the random-delimiter protocol.
           set +e
           $CLI "${args[@]}" --github-output "$GITHUB_OUTPUT"
           code=$?

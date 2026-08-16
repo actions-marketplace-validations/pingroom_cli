@@ -10,7 +10,8 @@
     "test": "node --test \"test/*.test.mjs\""
   },
   "files": [
-    "bin"
+    "bin",
+    "lib"
   ],
   "engines": {
     "node": ">=20"

@@ -6,11 +6,6 @@ from CI, scripts, and agents. Delivered as push straight to your phone.
 One dependency (`qrcode-terminal`, used only to draw the pairing QR). Works
 anywhere Node ≥ 20 runs.
 
-> **Release status:** 0.7.2 is prepared for publish — the room grant, the
-> `attachments:write` scope `--attach` always needed, and actionable text on the
-> refusals you can fix. The GitHub Action pins 0.7.2, so publish before relying
-> on it.
-
 ## Install and first run
 
 Install globally, then connect:
@@ -365,15 +360,36 @@ Full protocol: <https://pingroom.io/liveactivities.md>
     message: 'Ship ${{ github.sha }} to production?'
     handoff: 'true'
     question: 'true'
-    options: 'deploy:Deploy,hold:Hold'
+    options: |
+      deploy:Deploy
+      hold:Hold
     idempotency-key: 'deploy-${{ github.run_id }}'
     wait: 'true'
 - if: steps.gate.outputs.answer == 'deploy'
   run: ./deploy-prod.sh
+
+# Or ask the whole room instead of one person. Same outputs, plus question-id.
+- id: env
+  uses: pingroom/cli@v0
+  with:
+    token: ${{ secrets.PINGROOM_TOKEN }}
+    room: ab12cd
+    ask: 'true'
+    message: 'Which environment?'
+    context: 'build ${{ github.run_number }}'
+    options: |
+      prod:Production
+      staging:Staging
+    wait: 'true'
 ```
 
+`options` is one `value:label` per line. A single-line value still splits on
+commas for backward compatibility, so a label that contains a comma must be
+written one-per-line.
+
 The handoff action exposes outputs `handoff-id`, `state`, `acknowledged-by`,
-`answer`, and `delivery-state`.
+`answer`, and `delivery-state`; the ask action exposes `question-id`, `state`,
+and `answer`. `api` overrides the API base URL for every mode.
 
 ## GitLab CI
 

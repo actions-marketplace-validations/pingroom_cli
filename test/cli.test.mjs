@@ -43,20 +43,72 @@ test('GitHub Action exposes handoff inputs and outputs', () => {
   assert.doesNotMatch(action, /while IFS=['"]?=['"]? read/);
   assert.doesNotMatch(action, />>\s*"\$GITHUB_OUTPUT"/);
   assert.match(action, /exit \$code/);
-  assert.match(action, /@pingroom\/cli@0\.7\.2/);
+  assert.match(action, /@pingroom\/cli@\d+\.\d+\.\d+/);
 });
 
+test('GitHub Action exposes ask inputs and outputs through the same output protocol', () => {
+  const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
+  // Inputs
+  assert.match(action, /^  ask:/m);
+  assert.match(action, /^  context:/m);
+  assert.match(action, /^  timeout:/m);
+  assert.match(action, /^  api:/m);
+  // The API override rides an env var, not a flag, so it applies to every mode.
+  assert.match(action, /^        PINGROOM_API_URL: \$\{\{ inputs\.api \}\}$/m);
+  assert.doesNotMatch(action, /args\+=\(--api /);
+  // Output
+  assert.match(action, /^  question-id:/m);
+  // The ask branch must be reachable — i.e. come before the unconditional ping
+  // fallback — and reuse the shared splitter and the CLI-owned output file.
+  assert.match(action, /if \[ "\$PR_ASK" = "true" \]; then/);
+  assert.match(action, /args=\(ask -p "\$PR_MESSAGE" --room "\$PR_ROOM"\)/);
+  assert.ok(
+    action.indexOf('args=(ask -p "$PR_MESSAGE"') < action.indexOf('args=(ping -m "$PR_MESSAGE")'),
+    'the ask branch must precede the ping fallback',
+  );
+  assert.match(action, /args\+=\(-c "\$PR_CONTEXT"\)/);
+  assert.match(action, /args\+=\(--timeout "\$PR_TIMEOUT"\)/);
+  // Two branches, two re-raised exit codes, plus the ping fallback's own path.
+  assert.equal(action.match(/--github-output "\$GITHUB_OUTPUT"/g).length, 2);
+  assert.equal(action.match(/exit \$code/g).length, 2);
+});
+
+test('GitHub Action splits options on newlines first so a label may contain a comma', () => {
+  const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
+  // One shared splitter, used by every branch that forwards options.
+  assert.match(action, /^        split_options\(\) \{$/m);
+  // Newline-primary guard: a value containing a newline is never run through
+  // `tr ',' '\n'`, which used to shred "ship:Ship it, now" into two options.
+  assert.match(action, /if \[ "\$\{raw#\*\$'\\n'\}" != "\$raw" \]; then/);
+  assert.match(action, /for opt in "\$\{PR_OPTS\[@\]\}"; do args\+=\(-o "\$opt"\); done/);
+  // The comma fallback survives, but only for single-line input.
+  assert.match(action, /tr ',' '\\n'/);
+  // The input documents the newline form as the one that supports commas.
+  assert.match(action, /one per line \(preferred\)/);
+});
+
+// Release policy: package.json is the single source of the version — bin/ reads
+// it at startup — so no test hardcodes a literal. The Action's `npx` pin must be
+// bumped in the SAME COMMIT as package.json, and the lockfile bumped with it.
 test('source versions align while the GitHub Action stays on the published release', () => {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(join(__dirname, '..', 'package-lock.json'), 'utf8'));
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
-  assert.equal(pkg.version, '0.7.2');
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
   assert.equal(lock.version, pkg.version);
   assert.equal(lock.packages[''].version, pkg.version);
   // The Action must pin the concrete, clean-install-verified npm release, never
-  // a range or `latest`.
+  // a range or `latest` — and the same one this source tree declares.
   const pinned = action.match(/@pingroom\/cli@(\d+\.\d+\.\d+)/)?.[1];
-  assert.equal(pinned, '0.7.2');
+  assert.equal(pinned, pkg.version);
+});
+
+test('the published tarball carries every directory the entry point imports', () => {
+  const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
+  // A tarball missing `lib` installs a bin/ that cannot resolve its own imports,
+  // which only shows up after publish. Fail here instead.
+  assert.ok(pkg.files.includes('bin'), 'package.json files must include bin');
+  assert.ok(pkg.files.includes('lib'), 'package.json files must include lib');
 });
 
 /**
@@ -532,6 +584,23 @@ test('exit 2: watch without an id', () => {
   assert.match(stderr, /question id is required/);
 });
 
+test('the "await" alias for watch is dispatched, documented, and shares its help', () => {
+  // The alias existed in the dispatch table but nothing advertised it, so the
+  // only way to find it was reading the source.
+  const help = run(['--help']);
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /alias: await/);
+
+  const missingId = run(['await', '--token', 't']);
+  assert.equal(missingId.status, 2);
+  assert.match(missingId.stderr, /question id is required/);
+
+  const aliasHelp = run(['await', '--help']);
+  assert.equal(aliasHelp.status, 0);
+  assert.equal(aliasHelp.stdout, run(['watch', '--help']).stdout);
+  assert.match(aliasHelp.stdout, /^watch:/);
+});
+
 test('exit 2: bad --scope', () => {
   const { status, stderr } = run(['ask', '--token', 't', '--room', 'ab12cd', '-p', 'x', '--scope', 'sideways']);
   assert.equal(status, 2);
@@ -650,6 +719,89 @@ test('ask --wait exits 3 on expiry', async () => {
     assert.equal(status, 3);
     assert.equal(stdout.trim(), '');
     assert.match(stderr, /question expired/);
+  } finally {
+    server.close();
+  }
+});
+
+test('ask --github-output writes the answered question through the delimiter protocol', async () => {
+  // The same containment the handoff path has: an answer that looks like output
+  // commands must land as one value, never as extra keys.
+  const maliciousAnswer = 'approve\nstate=answered\r\nquestion-id=owned\nEOF_like';
+  const { server, baseUrl } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({
+      status: 201,
+      body: { id: 'q_gh', state: 'pending' },
+    }),
+    'GET /api/agent/questions/q_gh/wait': () => ({
+      status: 200,
+      body: { id: 'q_gh', state: 'answered', answer: { value: maliciousAnswer, label: 'Untrusted' } },
+    }),
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-cli-ask-output-'));
+  const outputPath = join(dir, 'github-output');
+  try {
+    const { status, stdout, stderr } = await runAsync([
+      'ask', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl, '--wait',
+      '--github-output', outputPath, '-p', 'Deploy?', '-o', 'approve:Approve', '-o', 'hold:Hold',
+    ]);
+    assert.equal(status, 0, stderr);
+    // The stdout contract for `$(pingroom ask --wait ...)` is unchanged.
+    assert.equal(stdout, `${maliciousAnswer}\n`);
+
+    const raw = readFileSync(outputPath, 'utf8');
+    assert.match(raw, /^question-id<<pingroom_[0-9a-f]{48}$/m);
+    const outputs = parseGitHubOutputFile(raw);
+    assert.deepEqual(Object.keys(outputs).sort(), ['answer', 'question-id', 'state']);
+    assert.equal(outputs['question-id'], 'q_gh');
+    assert.equal(outputs.state, 'answered');
+    assert.equal(outputs.answer, maliciousAnswer);
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ask --github-output without --wait reports state=pending and no answer', async () => {
+  const { server, baseUrl } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({
+      status: 201,
+      body: { id: 'q_nowait', state: 'pending' },
+    }),
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-cli-ask-pending-'));
+  const outputPath = join(dir, 'github-output');
+  try {
+    const { status, stdout, stderr } = await runAsync([
+      'ask', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      '--github-output', outputPath, '-p', 'Deploy?',
+    ]);
+    assert.equal(status, 0, stderr);
+    assert.equal(stdout.trim(), 'q_nowait');
+
+    const outputs = parseGitHubOutputFile(readFileSync(outputPath, 'utf8'));
+    // `answer` must be absent, not empty: an unanswered question has no answer.
+    assert.deepEqual(Object.keys(outputs).sort(), ['question-id', 'state']);
+    assert.equal(outputs['question-id'], 'q_nowait');
+    assert.equal(outputs.state, 'pending');
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('exit 2: ask --github-output rejects an empty path instead of silently dropping outputs', async () => {
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_x', state: 'pending' } }),
+  });
+  try {
+    const { status, stderr } = await runAsync([
+      'ask', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      '--github-output', '', '-p', 'Deploy?',
+    ]);
+    assert.equal(status, 2);
+    assert.match(stderr, /--github-output must be a non-empty path/);
+    assert.equal(received.length, 1);
   } finally {
     server.close();
   }

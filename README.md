@@ -370,8 +370,9 @@ Full protocol: <https://pingroom.io/liveactivities.md>
   run: ./deploy-prod.sh
 
 # Or ask the whole room instead of one person. Same outputs, plus question-id.
+# Requires v0.7.3 or newer — see the note below before copying this block.
 - id: env
-  uses: pingroom/cli@v0
+  uses: pingroom/cli@v0.7.3
   with:
     token: ${{ secrets.PINGROOM_TOKEN }}
     room: ab12cd
@@ -384,8 +385,19 @@ Full protocol: <https://pingroom.io/liveactivities.md>
     wait: 'true'
 ```
 
-`options` is one `value:label` per line. A single-line value still splits on
-commas for backward compatibility, so a label that contains a comma must be
+### Version requirements
+
+`ask`, `context`, `timeout`, `api` and the `question-id` output were added in
+**v0.7.3**. Pin at least `pingroom/cli@v0.7.3` to use them. On an older pin —
+including `@v0` before it is moved to v0.7.3 — GitHub treats them as unexpected
+inputs, warns, and drops them; the step then falls through to the plain `ping`
+path, `outputs.answer` is never set, and any job gated on it silently proceeds.
+Everything else on this page (ping, `require-ack`, and the whole `handoff`
+family) works on `@v0`.
+
+`options` is one `value:label` per line. Trailing newlines are ignored first, so
+a value that is a single line after trimming — including a one-line `options: |`
+block — still splits on commas. A label that contains a comma must therefore be
 written one-per-line.
 
 The handoff action exposes outputs `handoff-id`, `state`, `acknowledged-by`,

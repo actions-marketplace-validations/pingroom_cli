@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import * as parserModule from '../lib/parser.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI = join(__dirname, '..', 'bin', 'pingroom.js');
@@ -101,6 +102,154 @@ test('source versions align while the GitHub Action stays on the published relea
   // a range or `latest` — and the same one this source tree declares.
   const pinned = action.match(/@pingroom\/cli@(\d+\.\d+\.\d+)/)?.[1];
   assert.equal(pinned, pkg.version);
+});
+
+/** Read action.yml once; every static Action assertion below shares it. */
+function readAction() {
+  return readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
+}
+
+/**
+ * Every flag `action.yml` hands the CLI, grouped by the subcommand it runs.
+ * Flags are read out of three places inside each branch: the `args=(<cmd> …)`
+ * initializer, every `args+=(…)` append, and anything appended directly to the
+ * `$CLI "${args[@]}"` invocation.
+ */
+function actionFlagsByCommand() {
+  const action = readAction();
+  const run = action.slice(action.indexOf('      run: |'));
+  const starts = [...run.matchAll(/args=\((\w+) /g)];
+  assert.ok(starts.length > 0, 'no `args=(<command> …)` invocation found in action.yml');
+  const byCommand = new Map();
+  starts.forEach((start, i) => {
+    const body = run.slice(start.index, starts[i + 1]?.index ?? run.length);
+    const flags = byCommand.get(start[1]) ?? new Set();
+    const groups = [
+      ...body.matchAll(/args\+?=\(([^)]*)\)/g),
+      ...body.matchAll(/\$CLI "\$\{args\[@\]\}"([^\n]*)/g),
+    ];
+    for (const [, group] of groups) {
+      for (const [token] of group.matchAll(/(?<![\w-])--?[A-Za-z][\w-]*/g)) flags.add(token);
+    }
+    byCommand.set(start[1], flags);
+  });
+  return byCommand;
+}
+
+/** command name -> the parser bin/pingroom.js dispatches it to. */
+function parserByCommand() {
+  const bin = readFileSync(CLI, 'utf8');
+  const table = bin.slice(bin.indexOf('const COMMANDS = {'));
+  const map = new Map();
+  for (const [, command, parserName] of table.matchAll(/^ {2}(\w+): \(rest\) => \w+\((parse\w+)\(rest\)\)/gm)) {
+    map.set(command, parserModule[parserName]);
+  }
+  return map;
+}
+
+test('every flag the GitHub Action passes is one the CLI parser accepts', () => {
+  // The gate a version comparison alone cannot provide. `ask --github-output`
+  // shipped dead because the flag was wired into the handoff parser only:
+  // action.yml and package.json both still read "0.7.2", so the release test
+  // passed while every ask run exited 2 with "Unknown option: --github-output".
+  //
+  // Both sides are derived — flags from action.yml, vocabulary from the parser
+  // tables — so a newly forwarded flag is covered without editing this test.
+  // The pin/version equality asserted above is what carries this check from
+  // this tree onto the release the Action actually invokes.
+  const parserFor = parserByCommand();
+  const byCommand = actionFlagsByCommand();
+
+  // The branches the Action can take. If one is renamed or dropped, fail here
+  // instead of silently checking less.
+  assert.deepEqual([...byCommand.keys()].sort(), ['ask', 'handoff', 'ping']);
+
+  for (const [command, flags] of byCommand) {
+    const parser = parserFor.get(command);
+    assert.ok(parser, `bin/pingroom.js does not dispatch "${command}" to a parser`);
+    assert.ok(parser.flags instanceof Set, `parser for "${command}" publishes no flag table`);
+    assert.ok(flags.size > 0, `no flags were parsed out of the ${command} branch`);
+    for (const flag of flags) {
+      assert.ok(
+        parser.flags.has(flag),
+        `action.yml passes "${command} ${flag}", which the CLI parser rejects as an unknown option`,
+      );
+    }
+  }
+});
+
+// `ask`, `context`, `timeout` and the `question-id` output landed in this
+// release. Anything older silently drops them.
+const MIN_ASK_VERSION = [0, 7, 3];
+const ASK_ERA_INPUTS = ['ask', 'context', 'timeout'];
+
+test('README pins the ask example to a tag that actually carries the ask inputs', () => {
+  // Documented under `@v0`, these inputs are dropped by GitHub as unexpected,
+  // the step falls through to the unconditional ping fallback, `outputs.answer`
+  // never sets, and the downstream approval gate silently never fires. A doc bug
+  // that fails OPEN, so the pin and the inputs must agree in the same example.
+  const readme = readFileSync(join(__dirname, '..', 'README.md'), 'utf8');
+  const compare = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+  let checked = 0;
+  for (const chunk of readme.split(/(?=^ *-? *uses: pingroom\/cli@)/m)) {
+    const ref = chunk.match(/^ *-? *uses: pingroom\/cli@(\S+)/m)?.[1];
+    if (!ref) continue;
+    // Bound the step at the end of its fenced block so later prose can't leak in.
+    const step = chunk.split(/^```/m)[0];
+    const used = ASK_ERA_INPUTS.filter((input) => new RegExp(`^ +${input}:`, 'm').test(step));
+    if (used.length === 0) continue;
+    checked += 1;
+    const version = ref.match(/^v(\d+)\.(\d+)\.(\d+)$/)?.slice(1).map(Number);
+    const want = `v${MIN_ASK_VERSION.join('.')}`;
+    assert.ok(version, `README documents ${used.join('/')} under the floating pin "${ref}"; pin an exact tag >= ${want}`);
+    assert.ok(
+      compare(version, MIN_ASK_VERSION) >= 0,
+      `README documents ${used.join('/')} under "${ref}", which predates ${want}`,
+    );
+  }
+  assert.ok(checked > 0, 'the README no longer documents the ask inputs at all');
+  // And the requirement is stated in prose, not left for the reader to infer.
+  assert.match(readme, new RegExp(`v${MIN_ASK_VERSION.join('\\.')}`));
+});
+
+/**
+ * Extract the Action's split_options() helper and run it under real bash, so the
+ * separator rule is exercised against the shipped shell rather than a paraphrase
+ * of it. Returns the resulting PR_OPTS elements.
+ */
+function runSplitOptions(input) {
+  const fn = readAction().match(/^( *)split_options\(\) \{\n[\s\S]*?\n\1\}$/m)?.[0];
+  assert.ok(fn, 'split_options() not found in action.yml');
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-split-'));
+  const script = join(dir, 'split.sh');
+  writeFileSync(script, [
+    fn,
+    'split_options "$1"',
+    'for o in "${PR_OPTS[@]}"; do printf \'%s\\n\' "$o"; done',
+    '',
+  ].join('\n'));
+  try {
+    const r = spawnSync('bash', [script, input], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.split('\n').filter((line) => line !== '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('split_options strips trailing newlines before choosing a separator', () => {
+  // `options: |` always carries a trailing newline. Choosing the separator
+  // BEFORE stripping it sent every single-line block scalar down the newline
+  // path, yielding ONE option whose label had swallowed the commas and the rest
+  // of the line — the exact input the `options` description tells users to send.
+  assert.deepEqual(runSplitOptions('deploy:Deploy,hold:Hold'), ['deploy:Deploy', 'hold:Hold']);
+  assert.deepEqual(runSplitOptions('deploy:Deploy,hold:Hold\n'), ['deploy:Deploy', 'hold:Hold']);
+  assert.deepEqual(runSplitOptions('deploy:Deploy\nhold:Hold\n'), ['deploy:Deploy', 'hold:Hold']);
+  // A newline surviving the strip still wins, so a comma inside a label is kept.
+  assert.deepEqual(runSplitOptions('ship:Ship it, now\nhold:Hold'), ['ship:Ship it, now', 'hold:Hold']);
+  // The strip runs before the decision, not instead of it: an all-blank value
+  // yields no options rather than one empty one.
+  assert.deepEqual(runSplitOptions('  \n '), []);
 });
 
 test('the published tarball carries every directory the entry point imports', () => {
@@ -1201,12 +1350,15 @@ function runHook(args, stdin, env = {}) {
 }
 
 test('hook --print-config prints a pasteable settings.json with the pinned version', async () => {
+  const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
   const { status, stdout } = await runHook(['--print-config'], '');
   assert.equal(status, 0);
   assert.match(stdout, /~\/\.claude\/settings\.json/);
   assert.match(stdout, /"PreToolUse"/);
   assert.match(stdout, /"matcher": "Bash"/);
-  assert.match(stdout, /npx --yes @pingroom\/cli@0\.7\.2 hook/);
+  // Derived from package.json, never a literal: the printed config pins the
+  // running version, so hardcoding one turns every release into a test edit.
+  assert.ok(stdout.includes(`npx --yes @pingroom/cli@${pkg.version} hook`), stdout);
   assert.match(stdout, /stored credential and paired room automatically/);
   assert.doesNotMatch(stdout, /^#\s+export PINGROOM_TOKEN/m);
 });

@@ -49,7 +49,7 @@ inputs:
     required: false
     default: 'false'
   options:
-    description: 'Answer options as value:label, one per line (preferred), e.g. "deploy:Deploy\nhold:Hold". A single-line value still splits on commas, so a label containing a comma MUST use the newline form. Between 2 and 4.'
+    description: 'Answer options as value:label, one per line (preferred), e.g. "deploy:Deploy\nhold:Hold". Trailing newlines are ignored, so a value that is a single line after trimming still splits on commas — a label containing a comma MUST use the newline form. Between 2 and 4.'
     required: false
   target:
     description: 'For a handoff: recipient — "me" (default) or a specific user uuid.'
@@ -146,17 +146,25 @@ runs:
         set -o pipefail
         # Release gate: keep the Action on an npm-published version. Advance
         # this independently only after the matching CLI package is public.
-        CLI="npx --yes @pingroom/cli@0.7.2"
+        CLI="npx --yes @pingroom/cli@0.7.3"
 
         # Split an options input into the PR_OPTS array, one value:label spec per
-        # element. Newline-primary: if the input contains ANY newline, newlines
-        # are the only separator, so a label may itself contain commas
-        # ("ship:Ship it, now"). A single-line input still splits on commas for
-        # backward compatibility — which is why a comma-bearing label must be
-        # written one-per-line.
+        # element.
+        #
+        # Trailing whitespace is stripped FIRST, then the separator is chosen.
+        # Order matters: a YAML block scalar (`options: |`) always appends a
+        # trailing newline, so testing before the strip sent even a single-line
+        # block scalar down the newline path and produced ONE option whose label
+        # had swallowed the commas and the rest of the line.
+        #
+        # After the strip: if a newline still remains, newlines are the only
+        # separator, so a label may itself contain commas ("ship:Ship it, now").
+        # Otherwise the value splits on commas — which is why a comma-bearing
+        # label must be written one-per-line.
         split_options() {
           PR_OPTS=()
           local raw="$1" src opt
+          raw="${raw%"${raw##*[![:space:]]}"}"
           if [ "${raw#*$'\n'}" != "$raw" ]; then
             src="$raw"
           else

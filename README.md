@@ -201,8 +201,9 @@ pingroom ping --token "$PINGROOM_TOKEN" --room AB12 -m "Nightly report" \
   --attach ./report.pdf --attach ./summary.md
 ```
 
-Accepted types are `md`, `pdf`, `html`, `txt`, `jpg`, `jpeg`, `png`, up to
-5 MiB each and at most 4 per Ping. `--attach` needs an agent token — a webhook ping
+Accepted types are `md`, `pdf`, `html`, `txt`, `jpg`, `jpeg`, `png`, `zip`, up to
+5 MiB each and at most 4 per Ping. A `.zip` must be a real archive starting at
+byte zero — the server rejects one with any payload prefixed to it. `--attach` needs an agent token — a webhook ping
 has no uploader identity to bind private files to — and the bound account must
 hold Pro (otherwise the upload fails with `pro_required`). An upload that never
 reaches a ping expires by itself after 24 hours.

@@ -3327,7 +3327,7 @@ test('the shipped binary does not advertise the TTY override', () => {
 test('help advertises the attachment type, size, and count contract', () => {
   const { status, stdout } = run(['--help']);
   assert.equal(status, 0);
-  assert.match(stdout, /md\/pdf\/html\/txt\/jpg\/jpeg\/png, <= 5 MiB/);
+  assert.match(stdout, /md\/pdf\/html\/txt\/jpg\/jpeg\/png\/zip, <= 5 MiB/);
   assert.match(stdout, /repeat for up to 4/);
 });
 
@@ -3423,9 +3423,9 @@ test('--attach enforces the four-file and 5 MiB limits before uploading', () => 
 
 test('--attach rejects a webhook ping, an unsupported type, and a missing file', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pingroom-attach-'));
-  const zip = join(dir, 'payload.zip');
+  const binary = join(dir, 'payload.exe');
   const notes = join(dir, 'notes.txt');
-  writeFileSync(zip, 'PK');
+  writeFileSync(binary, 'MZ');
   writeFileSync(notes, 'private notes');
 
   try {
@@ -3436,10 +3436,10 @@ test('--attach rejects a webhook ping, an unsupported type, and a missing file',
     assert.match(webhook.stderr, /--attach requires an agent token/);
 
     const badType = run(
-      ['ping', '-m', 'hi', '--attach', zip, '--token', 'tok_abc', '--room', 'AB12'],
+      ['ping', '-m', 'hi', '--attach', binary, '--token', 'tok_abc', '--room', 'AB12'],
     );
     assert.equal(badType.status, 2);
-    assert.match(badType.stderr, /only md, pdf, html, txt, jpg, jpeg, png/);
+    assert.match(badType.stderr, /only md, pdf, html, txt, jpg, jpeg, png, zip/);
 
     const missing = run(
       ['ping', '-m', 'hi', '--attach', join(dir, 'nope.txt'), '--token', 'tok_abc', '--room', 'AB12'],

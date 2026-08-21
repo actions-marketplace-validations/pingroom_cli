@@ -592,6 +592,30 @@ test('exit 0: successful webhook delivery', async () => {
   }
 });
 
+test('ping accepts the 160-character public-room ceiling and a 40-character title', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      received.push(JSON.parse(body));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"success":true}');
+    });
+  });
+  try {
+    const message = '🚀'.repeat(160);
+    const title = 't'.repeat(40);
+    const { status, stderr } = await runAsync([
+      'ping', '-w', `${baseUrl}/hook`, '-m', message, '-t', title,
+    ]);
+    assert.equal(status, 0, stderr);
+    assert.deepEqual(received, [{ message, title }]);
+  } finally {
+    server.close();
+  }
+});
+
 test('exit 0: link ping folds --url/--button-label into data', async () => {
   const received = [];
   const { server, baseUrl } = await startServer((req, res) => {
@@ -1390,6 +1414,42 @@ test('hook Stop pings the room with the last assistant message', async () => {
     assert.equal(body.message, 'Refactored auth module, 3 files changed.');
     assert.equal(body.correlation_id, 's-1');
     assert.deepEqual(body.data, { event: 'Stop', session_id: 's-1', cwd: '/work' });
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('hook-generated ping bodies stop at the public-room ceiling', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-cli-transcript-limit-'));
+  const transcript = join(dir, 'session.jsonl');
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(transcript, JSON.stringify({
+    type: 'assistant',
+    message: { role: 'assistant', content: 'x'.repeat(200) },
+  }));
+
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/notifications': () => ({ status: 201, body: { id: 'n1' } }),
+  });
+  try {
+    const env = { PINGROOM_TOKEN: 'tok', PINGROOM_ROOM: 'ab12cd' };
+    const stopped = await runHook(
+      ['--api', baseUrl],
+      { hook_event_name: 'Stop', transcript_path: transcript },
+      env,
+    );
+    const notified = await runHook(
+      ['--api', baseUrl],
+      { hook_event_name: 'Notification', message: 'y'.repeat(200) },
+      env,
+    );
+
+    assert.equal(stopped.status, 0, stopped.stderr);
+    assert.equal(notified.status, 0, notified.stderr);
+    const [stopBody, notificationBody] = received.map(({ body }) => JSON.parse(body));
+    assert.equal(stopBody.message, `${'x'.repeat(159)}…`);
+    assert.equal(notificationBody.message, `${'y'.repeat(159)}…`);
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });
@@ -3778,11 +3838,11 @@ test('over-long fields fail locally with the limit named, not as a 422', async (
   });
 
   const cases = [
-    { argv: ['ping', '-m', 'x'.repeat(501)], expect: /--message must be at most 500 characters \(got 501\)/ },
+    { argv: ['ping', '-m', 'x'.repeat(161)], expect: /--message must be at most 160 characters \(got 161\)/ },
     { argv: ['ping', '-m', 'ok', '-t', 'x'.repeat(41)], expect: /--title must be at most 40 characters/ },
     { argv: ['ask', '-p', 'x'.repeat(501)], expect: /--prompt must be at most 500 characters/ },
     { argv: ['ask', '-p', 'ok', '-c', 'x'.repeat(41)], expect: /--context must be at most 40 characters/ },
-    // The live card's message is 256, not the 500 a ping body gets.
+    // Live status is a structured payload with its own 256-character contract.
     { argv: ['live', 'start', '-c', 'x', '-m', 'x'.repeat(257)], expect: /--message must be at most 256 characters/ },
   ];
 

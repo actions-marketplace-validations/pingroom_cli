@@ -153,7 +153,7 @@ URL (it embeds its own secret — treat it like a password and store it as a CI 
 ```
 pingroom ping [options]
 
-  -m, --message <text>   Ping body text (required)
+  -m, --message <text>   Ping body (required; <= 120 private / <= 160 public)
   -t, --title <text>     Ping title (<= 40 chars)
   -a, --action <1-4>     Quick-action slot to attribute the ping to
   -d, --data <json>      Extra JSON data, e.g. '{"commit":"abc123"}'
@@ -168,6 +168,11 @@ pingroom ping [options]
       --api <url>        API base URL (env PINGROOM_API_URL)
       --json             Print the raw JSON response
 ```
+
+Ping titles are limited to 40 characters. Bodies are limited to 120 characters
+in private rooms and 160 in public rooms. A room code or webhook URL does not
+reveal room visibility, so the CLI rejects only bodies over 160 locally; the
+server applies the tighter 120-character private-room limit.
 
 To make the ping actionable, add `--require-ack`. The first eligible recipient to
 acknowledge it wins; `--ack-timeout` optionally expires it if nobody responds:

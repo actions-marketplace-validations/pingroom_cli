@@ -7,7 +7,7 @@ branding:
 
 inputs:
   message:
-    description: 'Ping body text, or the prompt a human reads for a handoff (required).'
+    description: 'Ping body (max 120 private / 160 public), or the Question/Handoff prompt (required; separate 500-char limit).'
     required: true
   webhook-url:
     description: 'Room webhook URL. Best for CI — carries its own secret, no browser auth. Store it as a secret.'

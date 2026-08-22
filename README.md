@@ -397,6 +397,13 @@ Full protocol: <https://pingroom.io/liveactivities.md>
 including `@v0` before it is moved to v0.7.3 — GitHub treats them as unexpected
 inputs, warns, and drops them; the step then falls through to the plain `ping`
 path, `outputs.answer` is never set, and any job gated on it silently proceeds.
+
+`urgent` was added in **v0.7.4** and has the same failure mode on an older pin:
+GitHub drops the unknown input and the Ping goes out at normal priority, which
+looks like it worked. `require-ack` is not a substitute — as of the same release
+it opens the acknowledgement lifecycle without raising the interruption level,
+so a workflow that used it to break through Focus needs `urgent: true`.
+
 Everything else on this page (ping, `require-ack`, and the whole `handoff`
 family) works on `@v0`.
 

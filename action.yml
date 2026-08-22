@@ -33,8 +33,12 @@ inputs:
   button-label:
     description: 'Link button text (<= 26 chars; requires `url`).'
     required: false
+  urgent:
+    description: 'Deliver the ping time-sensitive so it breaks through Focus / Do Not Disturb. Delivery priority only - independent of `require-ack`, and it asks nothing of the recipient.'
+    required: false
+    default: 'false'
   require-ack:
-    description: 'Keep the ping open until one eligible recipient acknowledges it.'
+    description: 'Keep the ping open until one eligible recipient acknowledges it, showing a lock-screen card with an Acknowledge button. Does not raise the interruption level on its own - set `urgent` too for an acknowledgement that also cuts through Focus.'
     required: false
     default: 'false'
   ack-timeout:
@@ -127,6 +131,7 @@ runs:
         PR_URL: ${{ inputs.url }}
         PR_BUTTON_LABEL: ${{ inputs.button-label }}
         PR_ROOM: ${{ inputs.room }}
+        PR_URGENT: ${{ inputs.urgent }}
         PR_REQUIRE_ACK: ${{ inputs.require-ack }}
         PR_ACK_TIMEOUT: ${{ inputs.ack-timeout }}
         PR_HANDOFF: ${{ inputs.handoff }}
@@ -232,6 +237,7 @@ runs:
         [ -n "$PR_URL" ]    && args+=(--url "$PR_URL")
         [ -n "$PR_BUTTON_LABEL" ] && args+=(--button-label "$PR_BUTTON_LABEL")
         [ -n "$PR_ROOM" ]   && args+=(--room "$PR_ROOM")
+        [ "$PR_URGENT" = "true" ] && args+=(--urgent)
         [ "$PR_REQUIRE_ACK" = "true" ] && args+=(--require-ack)
         [ -n "$PR_ACK_TIMEOUT" ] && args+=(--ack-timeout "$PR_ACK_TIMEOUT")
         $CLI "${args[@]}"

@@ -19,6 +19,12 @@ test('GitHub Action forwards acknowledgement inputs to the CLI', () => {
   assert.match(action, /args\+=\(--ack-timeout "\$PR_ACK_TIMEOUT"\)/);
 });
 
+test('GitHub Action forwards urgency as its own input, separate from acknowledgement', () => {
+  const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
+  assert.match(action, /^  urgent:/m);
+  assert.match(action, /args\+=\(--urgent\)/);
+});
+
 test('GitHub Action exposes handoff inputs and outputs', () => {
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
   // Handoff inputs
@@ -590,6 +596,84 @@ test('exit 0: successful webhook delivery', async () => {
   } finally {
     server.close();
   }
+});
+
+// Urgency and acknowledgement are independent flags. They used to be one, so
+// `--urgent` must never smuggle `requires_ack` into the body, and
+// `--require-ack` must never smuggle `is_urgent`.
+test('ping --urgent sends is_urgent alone', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+  });
+  try {
+    const { status } = await runAsync(['ping', '-w', `${baseUrl}/hook`, '-m', 'prod is down', '--urgent']);
+    assert.equal(status, 0);
+    assert.deepEqual(JSON.parse(received[0]), { message: 'prod is down', is_urgent: true });
+  } finally {
+    server.close();
+  }
+});
+
+test('ping --require-ack does not imply is_urgent', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+  });
+  try {
+    const { status } = await runAsync(['ping', '-w', `${baseUrl}/hook`, '-m', 'confirm', '--require-ack']);
+    assert.equal(status, 0);
+    assert.deepEqual(JSON.parse(received[0]), { message: 'confirm', requires_ack: true });
+  } finally {
+    server.close();
+  }
+});
+
+test('ping sends both flags when both are asked for', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+  });
+  try {
+    const { status } = await runAsync([
+      'ping', '-w', `${baseUrl}/hook`, '-m', 'ack me now', '--urgent', '--require-ack',
+    ]);
+    assert.equal(status, 0);
+    assert.deepEqual(JSON.parse(received[0]), {
+      message: 'ack me now', requires_ack: true, is_urgent: true,
+    });
+  } finally {
+    server.close();
+  }
+});
+
+// `live` deliberately has no --urgent: a stream starts time-sensitive via
+// `--category alert`, and the live-status endpoint does not accept is_urgent,
+// so a parsed-then-dropped flag would be worse than a usage error.
+test('exit 2: live rejects --urgent and points at --category alert', async () => {
+  const { status, stderr } = await runAsync([
+    'live', 'start', '-c', 'run-1', '-m', 'x', '--urgent', '--webhook', 'http://127.0.0.1:1/hook',
+  ]);
+  assert.equal(status, 2);
+  assert.match(stderr, /--urgent/);
 });
 
 test('ping accepts the 160-character public-room ceiling and a 40-character title', async () => {

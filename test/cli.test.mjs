@@ -414,6 +414,7 @@ test('exit 0: ping -h prints the ping-focused help, not the full reference', () 
   assert.equal(status, 0);
   assert.match(stdout, /^ping options:/);
   assert.match(stdout, /-m, --message <text>/);
+  assert.match(stdout, /--location <lat,lng>/);
   assert.match(stdout, /Shared:/);
   assert.doesNotMatch(stdout, /pingroom — send a ping/);
   assert.doesNotMatch(stdout, /ask options/);
@@ -553,6 +554,54 @@ test('exit 2: --button-label over 26 chars', () => {
   ]);
   assert.equal(status, 2);
   assert.match(stderr, /--button-label must be at most 26 characters/);
+});
+
+test('exit 2: location metadata flags require --location', () => {
+  for (const [flag, value] of [
+    ['--location-label', 'Office'],
+    ['--location-address', '1 Main Street'],
+  ]) {
+    const { status, stderr } = run([
+      'ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi', flag, value,
+    ]);
+    assert.equal(status, 2);
+    assert.match(stderr, new RegExp(`${flag} requires --location`));
+  }
+});
+
+test('exit 2: --location requires exactly two finite numeric coordinates', () => {
+  for (const value of ['25.2', '25.2,55.3,7', 'NaN,55.3', '25.2,Infinity', 'north,west']) {
+    const { status, stderr } = run([
+      'ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi', '--location', value,
+    ]);
+    assert.equal(status, 2, value);
+    assert.match(stderr, /--location.*(?:exactly two|finite numbers)/, value);
+  }
+});
+
+test('exit 2: --location enforces latitude and longitude ranges', () => {
+  for (const [value, coordinate] of [['90.1,0', 'latitude'], ['0,-180.1', 'longitude']]) {
+    const { status, stderr } = run([
+      'ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi', '--location', value,
+    ]);
+    assert.equal(status, 2);
+    assert.match(stderr, new RegExp(`${coordinate} must be between`));
+  }
+});
+
+test('exit 2: location display caps count Unicode characters', () => {
+  const tooLong = [
+    ['--location-label', '📍'.repeat(101), /at most 100 characters/],
+    ['--location-address', '📍'.repeat(256), /at most 255 characters/],
+  ];
+  for (const [flag, value, expected] of tooLong) {
+    const { status, stderr } = run([
+      'ping', '-w', 'http://127.0.0.1:1/hook', '-m', 'hi',
+      '--location', '0,0', flag, value,
+    ]);
+    assert.equal(status, 2);
+    assert.match(stderr, expected);
+  }
 });
 
 test('exit 2: --token without --room', () => {
@@ -727,6 +776,43 @@ test('exit 0: link ping folds --url/--button-label into data', async () => {
   }
 });
 
+test('exit 0: webhook location flags replace raw data.location and preserve siblings', async () => {
+  const received = [];
+  const { server, baseUrl } = await startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(JSON.parse(body));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+  });
+  try {
+    const { status, stderr } = await runAsync([
+      'ping', '-w', `${baseUrl}/hook`, '-m', 'meet here',
+      '-d', '{"event":"lunch","location":{"latitude":1,"longitude":2,"stale":true}}',
+      '--location', ' 25.2048, 55.2708 ',
+      '--location-label', '📍'.repeat(100),
+      '--location-address', '📍'.repeat(255),
+    ]);
+    assert.equal(status, 0, stderr);
+    assert.deepEqual(received, [{
+      message: 'meet here',
+      data: {
+        event: 'lunch',
+        location: {
+          latitude: 25.2048,
+          longitude: 55.2708,
+          label: '📍'.repeat(100),
+          address: '📍'.repeat(255),
+        },
+      },
+    }]);
+  } finally {
+    server.close();
+  }
+});
+
 test('exit 0: successful agent-token delivery via --api override', async () => {
   const received = [];
   const { server, baseUrl } = await startServer((req, res) => {
@@ -742,6 +828,7 @@ test('exit 0: successful agent-token delivery via --api override', async () => {
     const { status, stdout } = await runAsync([
       'ping', '--token', 'tok_abc', '--room', 'ab12cd', '--api', baseUrl,
       '-m', 'shipped', '-t', 'CI', '-a', '2', '-d', '{"version":"1.4.0"}',
+      '--location', '-90,180',
       '--require-ack', '--ack-timeout', '300',
     ]);
     assert.equal(status, 0);
@@ -749,7 +836,8 @@ test('exit 0: successful agent-token delivery via --api override', async () => {
     assert.equal(received[0].url, '/api/agent/rooms/ab12cd/notifications');
     assert.equal(received[0].auth, 'Bearer tok_abc');
     assert.deepEqual(JSON.parse(received[0].body), {
-      message: 'shipped', title: 'CI', action_number: 2, data: { version: '1.4.0' },
+      message: 'shipped', title: 'CI', action_number: 2,
+      data: { version: '1.4.0', location: { latitude: -90, longitude: 180 } },
       requires_ack: true, ack_timeout_seconds: 300,
     });
   } finally {

@@ -159,6 +159,9 @@ pingroom ping [options]
   -d, --data <json>      Extra JSON data, e.g. '{"commit":"abc123"}'
       --url <https-url>  Make the ping a tappable link (absolute http(s) URL)
       --button-label <t> Link button text (<= 26 chars; requires --url)
+      --location <lat,lng>  Attach a map location (latitude,longitude)
+      --location-label <t>  Location label (<= 100 chars; requires --location)
+      --location-address <t> Address (<= 255 chars; requires --location)
       --require-ack      Keep the ping open until an eligible recipient acknowledges it
       --ack-timeout <s>  Ack deadline in seconds (requires --require-ack)
       --attach <path>    Attach a file; repeat for up to 4 (requires --token)
@@ -173,6 +176,23 @@ Ping titles are limited to 40 characters. Bodies are limited to 120 characters
 in private rooms and 160 in public rooms. A room code or webhook URL does not
 reveal room visibility, so the CLI rejects only bodies over 160 locally; the
 server applies the tighter 120-character private-room limit.
+
+To send a location, pass decimal latitude and longitude as one comma-separated
+value. Optional map text rides inside the same reserved `data.location` object:
+
+```bash
+pingroom ping --room ab12cd -m "Meet me here" \
+  --location "25.2048,55.2708" \
+  --location-label "Dubai Mall" \
+  --location-address "Downtown Dubai"
+```
+
+Latitude is inclusive -90..90 and longitude is inclusive -180..180. Labels are
+limited to 100 Unicode characters and addresses to 255. The recipient can share
+the point or open it in Waze, Google Maps, Apple Maps, or another installed map
+app. These flags work with agent-token and incoming-webhook sends. When combined
+with `--data`, the explicit flags replace only `data.location`; sibling keys are
+preserved.
 
 To make the ping actionable, add `--require-ack`. The first eligible recipient to
 acknowledge it wins; `--ack-timeout` optionally expires it if nobody responds:

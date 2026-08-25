@@ -55,8 +55,11 @@ inputs:
   options:
     description: 'Answer options as value:label, one per line (preferred), e.g. "deploy:Deploy\nhold:Hold". Trailing newlines are ignored, so a value that is a single line after trimming still splits on commas — a label containing a comma MUST use the newline form. Between 2 and 4.'
     required: false
+  scope:
+    description: 'For an ask: who may answer — "direct" (default, the connecting account) or "room" (anyone in the room).'
+    required: false
   target:
-    description: 'For a handoff: recipient — "me" (default) or a specific user uuid.'
+    description: 'Recipient. For a handoff: "me" (default) or a specific user uuid. For an ask: a specific room member uuid — "me" is NOT accepted there and is rejected by the API.'
     required: false
   expires-in:
     description: 'For a handoff: expiry in seconds (120..86400, default 900).'
@@ -138,6 +141,7 @@ runs:
         PR_QUESTION: ${{ inputs.question }}
         PR_OPTIONS: ${{ inputs.options }}
         PR_TARGET: ${{ inputs.target }}
+        PR_SCOPE: ${{ inputs.scope }}
         PR_EXPIRES_IN: ${{ inputs.expires-in }}
         PR_URGENCY: ${{ inputs.urgency }}
         PR_IDEMPOTENCY_KEY: ${{ inputs.idempotency-key }}
@@ -151,7 +155,7 @@ runs:
         set -o pipefail
         # Release gate: keep the Action on an npm-published version. Advance
         # this independently only after the matching CLI package is public.
-        CLI="npx --yes @pingroom/cli@0.7.4"
+        CLI="npx --yes @pingroom/cli@0.7.5"
 
         # Split an options input into the PR_OPTS array, one value:label spec per
         # element.
@@ -214,6 +218,7 @@ runs:
             for opt in "${PR_OPTS[@]}"; do args+=(-o "$opt"); done
           fi
           [ -n "$PR_CONTEXT" ]        && args+=(-c "$PR_CONTEXT")
+          [ -n "$PR_SCOPE" ]          && args+=(--scope "$PR_SCOPE")
           [ -n "$PR_TARGET" ]         && args+=(--target "$PR_TARGET")
           [ -n "$PR_CORRELATION_ID" ] && args+=(--correlation-id "$PR_CORRELATION_ID")
           [ -n "$PR_REPLY_TO" ]       && args+=(--reply-to "$PR_REPLY_TO")

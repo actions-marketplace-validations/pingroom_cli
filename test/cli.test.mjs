@@ -25,6 +25,26 @@ test('GitHub Action forwards urgency as its own input, separate from acknowledge
   assert.match(action, /args\+=\(--urgent\)/);
 });
 
+test('GitHub Action can ask the room, not only the connecting account', () => {
+  // Without a `scope` input every Action question defaults to responder_scope
+  // "direct", so a workflow written to poll the room quietly polled one person
+  // and still reported success.
+  const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
+  assert.match(action, /^  scope:/m);
+  assert.match(action, /PR_SCOPE: \$\{\{ inputs\.scope \}\}/);
+  assert.match(action, /args\+=\(--scope "\$PR_SCOPE"\)/);
+});
+
+test('GitHub Action does not advertise "me" as an ask target', () => {
+  // `me` is a handoff-only shorthand; the questions API wants a member uuid and
+  // rejects it. One shared `target` input feeds both branches, so the
+  // description has to say which is which.
+  const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
+  const target = action.split('\n').find((l) => l.includes('For a handoff: "me"'));
+  assert.ok(target, 'target input description not found');
+  assert.match(target, /For an ask: a specific room member uuid/);
+});
+
 test('GitHub Action exposes handoff inputs and outputs', () => {
   const action = readFileSync(join(__dirname, '..', 'action.yml'), 'utf8');
   // Handoff inputs
@@ -1592,7 +1612,13 @@ test('hook Stop pings the room with the last assistant message', async () => {
   }
 });
 
-test('hook-generated ping bodies stop at the public-room ceiling', async () => {
+// Regression: these bodies used to stop at the PUBLIC ceiling (160). A hook
+// room is private, so StoreNotificationRequest caps them at 120 and rejects —
+// and hookPing swallows the 422, so every long Claude summary was silently
+// dropped. `ping --message` still uses the public ceiling on purpose (the
+// caller typed that text and cannot know the room's visibility); this path is
+// different because the CLI composes the text itself and is already truncating.
+test('hook-generated ping bodies stop at the private-room ceiling the server enforces', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pingroom-cli-transcript-limit-'));
   const transcript = join(dir, 'session.jsonl');
   const { writeFileSync } = await import('node:fs');
@@ -1620,8 +1646,11 @@ test('hook-generated ping bodies stop at the public-room ceiling', async () => {
     assert.equal(stopped.status, 0, stopped.stderr);
     assert.equal(notified.status, 0, notified.stderr);
     const [stopBody, notificationBody] = received.map(({ body }) => JSON.parse(body));
-    assert.equal(stopBody.message, `${'x'.repeat(159)}…`);
-    assert.equal(notificationBody.message, `${'y'.repeat(159)}…`);
+    assert.equal(stopBody.message, `${'x'.repeat(119)}…`);
+    assert.equal(notificationBody.message, `${'y'.repeat(119)}…`);
+    // 120 is what a private room accepts; anything longer comes back 422.
+    assert.equal(Array.from(stopBody.message).length, 120);
+    assert.equal(Array.from(notificationBody.message).length, 120);
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });

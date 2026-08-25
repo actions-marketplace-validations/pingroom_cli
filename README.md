@@ -395,13 +395,15 @@ Full protocol: <https://pingroom.io/liveactivities.md>
   run: ./deploy-prod.sh
 
 # Or ask the whole room instead of one person. Same outputs, plus question-id.
-# Requires v0.7.3 or newer — see the note below before copying this block.
+# `scope: room` is what opens it to the room — without it a question is
+# answerable only by the connecting account. Requires v0.7.5 or newer.
 - id: env
-  uses: pingroom/cli@v0.7.3
+  uses: pingroom/cli@v0.7.5
   with:
     token: ${{ secrets.PINGROOM_TOKEN }}
     room: ab12cd
     ask: 'true'
+    scope: 'room'
     message: 'Which environment?'
     context: 'build ${{ github.run_number }}'
     options: |
@@ -418,7 +420,13 @@ including `@v0` before it is moved to v0.7.3 — GitHub treats them as unexpecte
 inputs, warns, and drops them; the step then falls through to the plain `ping`
 path, `outputs.answer` is never set, and any job gated on it silently proceeds.
 
-`urgent` was added in **v0.7.4** and has the same failure mode on an older pin:
+`scope` was added in **v0.7.5**, and without it every `ask` goes out as a direct
+question to the connecting account — the step still succeeds, so an Action meant
+to poll the room silently polls one person instead.
+
+`urgent` shipped in the **0.7.4 npm package**, but no `v0.7.4` Action tag was
+ever cut, so **v0.7.5 is the first tag that carries it**. It has the same failure
+mode on an older pin:
 GitHub drops the unknown input and the Ping goes out at normal priority, which
 looks like it worked. `require-ack` is not a substitute — as of the same release
 it opens the acknowledgement lifecycle without raising the interruption level,

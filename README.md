@@ -506,6 +506,9 @@ Options are `value:label` pairs (repeat `-o` for 2–4). Omit them for the binar
 Approve/Deny default — two options is the lock-screen fast path. `--ttl` sets the
 expiry in seconds (default 1h; 30–86400). `--scope room` lets any eligible member
 answer (first tap wins); the default `direct` asks your bound user.
+`--idempotency-key <key>` sends a printable 1–255 character `Idempotency-Key`
+header. Retrying the same key with the same request returns the original
+Question; reusing it with a changed request returns `409 idempotency_conflict`.
 
 ## Handoffs (agent → human)
 

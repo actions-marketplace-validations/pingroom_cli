@@ -1011,6 +1011,67 @@ test('ask (no --wait) creates the question and prints its id', async () => {
   }
 });
 
+test('ask sends a bounded Idempotency-Key header without adding it to the body', async () => {
+  let idemHeader;
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_idem', state: 'pending' } }),
+  });
+  server.removeAllListeners('request');
+  server.on('request', (req, res) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      idemHeader = req.headers['idempotency-key'];
+      received.push({ method: req.method, path: req.url.split('?')[0], auth: req.headers.authorization, body });
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'q_idem', state: 'pending' }));
+    });
+  });
+  try {
+    const { status, stdout, stderr } = await runAsync([
+      'ask', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      '-p', 'Ship?', '--idempotency-key', 'x-publish-approval:v1:abc123',
+    ]);
+    assert.equal(status, 0, stderr);
+    assert.equal(stdout.trim(), 'q_idem');
+    assert.equal(idemHeader, 'x-publish-approval:v1:abc123');
+    assert.deepEqual(JSON.parse(received[0].body), { prompt: 'Ship?' });
+  } finally {
+    server.close();
+  }
+});
+
+test('ask rejects unsafe Idempotency-Key values before creating a question', () => {
+  for (const key of ['', 'contains space', 'line\nbreak', 'x'.repeat(256)]) {
+    const { status, stderr } = run([
+      'ask', '--token', 'tok', '--room', 'ab12cd', '-p', 'Ship?', '--idempotency-key', key,
+    ]);
+    assert.equal(status, 2, key);
+    assert.match(stderr, /--idempotency-key must be 1–255 printable ASCII/);
+  }
+});
+
+test('ask surfaces an idempotency conflict and never waits', async () => {
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({
+      status: 409,
+      body: { code: 'idempotency_conflict', message: 'Idempotency key already used for a different request.' },
+    }),
+  });
+  try {
+    const { status, stdout, stderr } = await runAsync([
+      'ask', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      '--wait', '-p', 'Changed?', '--idempotency-key', 'x-publish-approval:v1:abc123',
+    ]);
+    assert.equal(status, 1);
+    assert.equal(stdout, '');
+    assert.match(stderr, /ask failed: Idempotency key already used/);
+    assert.equal(received.length, 1);
+  } finally {
+    server.close();
+  }
+});
+
 test('ask serializes option styles, text_input, and reply_to', async () => {
   const { server, baseUrl, received } = await questionServer({
     'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_s', state: 'pending' } }),

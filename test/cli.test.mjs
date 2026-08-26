@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -904,6 +905,40 @@ test('exit 1: network error (connection refused)', () => {
   assert.match(stderr, /network error/);
 });
 
+test('exit 1: duplicate JSON keys from the API are rejected before command parsing', async () => {
+  const { server, baseUrl } = await startServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"id":"safe","id":"attacker","state":"pending"}');
+  });
+  try {
+    const { status, stderr } = await runAsync(
+      ['ask', '--token', 't', '--room', 'ab12cd', '--prompt', 'Approve?', '--json'],
+      { PINGROOM_API_URL: baseUrl },
+    );
+    assert.equal(status, 1);
+    assert.match(stderr, /untrusted JSON response.*duplicate object key/i);
+  } finally {
+    server.close();
+  }
+});
+
+test('exit 1: invalid UTF-8 from the API is rejected before command parsing', async () => {
+  const { server, baseUrl } = await startServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(Buffer.from([0xff]));
+  });
+  try {
+    const { status, stderr } = await runAsync(
+      ['ask', '--token', 't', '--room', 'ab12cd', '--prompt', 'Approve?', '--json'],
+      { PINGROOM_API_URL: baseUrl },
+    );
+    assert.equal(status, 1);
+    assert.match(stderr, /untrusted JSON response.*UTF-8/i);
+  } finally {
+    server.close();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Questions — ask / watch / list / cancel
 // ---------------------------------------------------------------------------
@@ -947,6 +982,20 @@ test('exit 2: watch without an id', () => {
   const { status, stderr } = run(['watch', '--token', 't']);
   assert.equal(status, 2);
   assert.match(stderr, /question id is required/);
+});
+
+test('--expected-room-sha256 pins the resolved room for ask, list, and watch', () => {
+  const expected = createHash('sha256').update('private-room', 'utf8').digest('hex');
+  const commands = [
+    ['ask', '--token', 't', '--room', 'other-room', '--prompt', 'Approve?'],
+    ['list', '--token', 't'],
+    ['watch', '--token', 't', 'q_1'],
+  ];
+  for (const command of commands) {
+    const { status, stderr } = run([...command, '--expected-room-sha256', expected], { PINGROOM_ROOM: 'other-room' });
+    assert.equal(status, 2);
+    assert.match(stderr, /resolved room does not match --expected-room-sha256/);
+  }
 });
 
 test('the "await" alias for watch is dispatched, documented, and shares its help', () => {

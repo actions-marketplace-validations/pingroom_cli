@@ -412,12 +412,25 @@ test('mcp prints the canonical endpoint and copy-ready client setup', () => {
   assert.equal(stderr, '');
   assert.match(stdout, /https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
   assert.match(stdout, /claude mcp add --transport http pingroom https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
+  assert.match(stdout, /codex mcp add pingroom --url https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
+  assert.match(stdout, /codex mcp login pingroom/);
+  assert.match(stdout, /OpenAI Plugins Directory \(ChatGPT and Codex\)/);
+  assert.doesNotMatch(stdout, /ChatGPT desktop app:/);
   assert.match(stdout, /"mcpServers"/);
   assert.match(stdout, /"pingroom": \{/);
   assert.match(stdout, /"url": "https:\/\/api\.pingroom\.io\/api\/agent\/mcp"/);
   assert.match(stdout, /Claude Desktop:/);
   assert.match(stdout, /Add custom connector/);
   assert.match(stdout, /does not modify client config/);
+});
+
+test('mcp add codex remains safe and output-only', () => {
+  const { status, stdout, stderr } = run(['mcp', 'add', 'codex']);
+  assert.equal(status, 0);
+  assert.equal(stderr, '');
+  assert.match(stdout, /No client configuration was changed/);
+  assert.match(stdout, /codex mcp add pingroom --url https:\/\/api\.pingroom\.io\/api\/agent\/mcp/);
+  assert.match(stdout, /codex mcp login pingroom/);
 });
 
 test('mcp add claude-code remains safe and output-only', () => {

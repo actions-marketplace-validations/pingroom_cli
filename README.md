@@ -593,18 +593,20 @@ tune the approval-question expiry with `--ttl <seconds>` (default 900).
 
 ## MCP client setup
 
-Print the canonical remote endpoint, a copy-ready Claude Code command, Cursor
-JSON, and the Claude Desktop custom-connector steps:
+Print the canonical remote endpoint, copy-ready Codex and Claude Code commands,
+Cursor JSON, Claude custom-connector steps, and the public OpenAI directory:
 
 ```bash
 pingroom mcp
 # no global install: npx --yes @pingroom/cli mcp
 ```
 
-`pingroom mcp add claude-code` prints the exact `claude mcp add` command but does
-not execute it or modify client configuration. After adding the server, use the
-client's MCP controls to authenticate in the browser; no PingRoom API key is
-pasted into its config.
+`pingroom mcp add codex` and `pingroom mcp add claude-code` print the exact setup
+commands but do not execute them or modify client configuration. After adding
+the server, use the client's MCP controls to authenticate in the browser; no
+PingRoom API key is pasted into its config. Once PingRoom's public listing is
+approved, the same plugin will also be discoverable in the Plugins Directory
+shared by ChatGPT and Codex.
 
 For a fully typed client, use [`@pingroom/sdk`](https://www.npmjs.com/package/@pingroom/sdk).
 See <https://pingroom.io/connect-mcp.md> for the complete MCP and OAuth guide.

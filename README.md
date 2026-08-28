@@ -641,6 +641,35 @@ shared by ChatGPT and Codex.
 For a fully typed client, use [`@pingroom/sdk`](https://www.npmjs.com/package/@pingroom/sdk).
 See <https://pingroom.io/connect-mcp.md> for the complete MCP and OAuth guide.
 
+## Agent skills
+
+Two ready-to-install [Claude Code skills](https://github.com/pingroom/skills)
+teach an agent when and how to reach a human — `pingroom-mcp` for conversational
+sessions, `pingroom-cli` for shells, CI, and hooks.
+
+```bash
+pingroom skills           # list them and every install route (prints only)
+pingroom skills install   # copy both into ~/.claude/skills (needs git)
+```
+
+`install` refuses to replace a skill that is already there; pass `--force` to
+replace it, or `--dir <path>` to install somewhere other than
+`~/.claude/skills`. Inside Claude Code you can instead use the plugin system,
+which keeps them updated:
+
+```
+/plugin marketplace add pingroom/skills
+/plugin install pingroom-mcp
+```
+
+## Update notifications
+
+When a newer `@pingroom/cli` is published the CLI prints a one-line notice on
+stderr, at most once every 24 hours. It is deliberately invisible to automation:
+the check is skipped entirely unless both stdout and stderr are a TTY, and
+whenever `CI` or `PINGROOM_NO_UPDATE_CHECK=1` is set. A failed or slow check is
+silent and can never change a command's output or exit code.
+
 ## License
 
 MIT

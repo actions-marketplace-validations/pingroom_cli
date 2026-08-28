@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as parserModule from '../lib/parser.js';
 
@@ -308,6 +308,10 @@ function baseEnv() {
   delete cleanEnv.PINGROOM_INTERNAL_ACTIVATION_TIMEOUT_MS;
   delete cleanEnv.NODE_ENV;
   cleanEnv.PINGROOM_HOME = EMPTY_HOME;
+  // No test may reach the npm registry. Spawned tests already have piped stdio
+  // (so the TTY gate suppresses the check), but a belt-and-braces opt-out keeps
+  // the suite hermetic if that gate is ever loosened.
+  cleanEnv.PINGROOM_NO_UPDATE_CHECK = '1';
   return cleanEnv;
 }
 
@@ -4264,4 +4268,91 @@ test('actions set validates the slot and required fields locally', () => {
   const missing = run(['actions', 'set', '2', '--token', 'x'.repeat(40), '--room', 'ABC123']);
   assert.equal(missing.status, 2);
   assert.match(missing.stderr, /needs --label and --icon/);
+});
+
+// --------------------------------------------------------------- skills
+
+test('skills lists both published skills and every install route', () => {
+  const { status, stdout } = run(['skills']);
+  assert.equal(status, 0);
+  assert.match(stdout, /https:\/\/github\.com\/pingroom\/skills/);
+  assert.match(stdout, /pingroom-mcp/);
+  assert.match(stdout, /pingroom-cli/);
+  // The three routes: this CLI, the Claude Code plugin system, and by hand.
+  assert.match(stdout, /pingroom skills install/);
+  assert.match(stdout, /\/plugin marketplace add pingroom\/skills/);
+  assert.match(stdout, /git clone https:\/\/github\.com\/pingroom\/skills\.git/);
+  // Same output-only promise `mcp` makes.
+  assert.match(stdout, /does not\.$/m);
+});
+
+test('skills is registered in the top-level help', () => {
+  const { status, stdout } = run(['--help']);
+  assert.equal(status, 0);
+  assert.match(stdout, /^  skills   List the PingRoom agent skills/m);
+  assert.match(stdout, /^skills:$/m);
+});
+
+test('skills --help does not advertise credential flags it cannot use', () => {
+  // `skills` talks to GitHub, never the PingRoom API. Printing --token/--api/
+  // --json here would describe flags its parser rejects.
+  const { status, stdout } = run(['skills', '--help']);
+  assert.equal(status, 0);
+  assert.match(stdout, /pingroom skills install/);
+  assert.doesNotMatch(stdout, /--token/);
+  assert.doesNotMatch(stdout, /--api /);
+  assert.doesNotMatch(stdout, /--json/);
+});
+
+test('skills rejects an unknown sub-command as a usage error', () => {
+  const { status, stderr } = run(['skills', 'bogus']);
+  assert.equal(status, 2);
+  assert.match(stderr, /usage: pingroom skills \[list\|install\]/);
+});
+
+test('skills install refuses to clobber before it touches the network', () => {
+  // The collision check runs BEFORE the clone on purpose: cloning first would
+  // spend a network round trip to report something the filesystem already knew.
+  // That ordering is what lets this test assert the guard with no network.
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-skills-'));
+  mkdirSync(join(dir, 'pingroom-mcp'), { recursive: true });
+  const { status, stderr } = run(['skills', 'install', '--dir', dir]);
+  assert.equal(status, 2);
+  assert.match(stderr, /already installed/);
+  assert.match(stderr, /pingroom-mcp/);
+  assert.match(stderr, /--force/);
+  // Nothing was created for the skill that had not been installed yet.
+  assert.equal(existsSync(join(dir, 'pingroom-cli')), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// --------------------------------------------------- update notification
+
+test('isNewer only upgrades on a strictly greater release number', async () => {
+  const { isNewer } = await import('../lib/update-check.js');
+  assert.equal(isNewer('0.8.0', '0.7.6'), true);
+  assert.equal(isNewer('0.10.0', '0.9.0'), true);
+  assert.equal(isNewer('1.0.0', '0.9.9'), true);
+  assert.equal(isNewer('0.7.6', '0.7.6'), false);
+  assert.equal(isNewer('0.7.5', '0.7.6'), false);
+  // A prerelease must never trigger the notice: npm's `latest` should not point
+  // at one, and guessing wrong nags on every single run.
+  assert.equal(isNewer('0.8.0-beta.1', '0.7.6'), false);
+  assert.equal(isNewer('', '0.7.6'), false);
+  assert.equal(isNewer(null, '0.7.6'), false);
+  assert.equal(isNewer('0.8.0', 'not-a-version'), false);
+});
+
+test('the update check stays silent and writes nothing when stdout is not a TTY', () => {
+  // Spawned with piped stdio, i.e. exactly how CI and `pingroom … | jq` run it.
+  const home = mkdtempSync(join(tmpdir(), 'pingroom-upd-'));
+  const { status, stderr } = run(['skills'], {
+    PINGROOM_HOME: home,
+    PINGROOM_NO_UPDATE_CHECK: '',
+    CI: '',
+  });
+  assert.equal(status, 0);
+  assert.equal(stderr, '');
+  assert.equal(existsSync(join(home, 'update-check.json')), false);
+  rmSync(home, { recursive: true, force: true });
 });

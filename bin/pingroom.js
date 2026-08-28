@@ -23,6 +23,7 @@
 //   live     Drive a live progress card (iOS Live Activity / Android live
 //            update) on the room members' lock screen: start / update / end.
 //   mcp      Print the canonical remote MCP endpoint and client setup snippets.
+//   skills   List the published agent skills, or install them for Claude Code.
 //   activate Send one optional test Question with the saved QR-paired credential.
 //   config   Read/write ~/.pingroom/config.json (default_room, api_url).
 //   logout   Forget the credential in ~/.pingroom/credentials.json.
@@ -39,9 +40,10 @@ import { EXIT } from '../lib/constants.js';
 import { fail, stripControlChars } from '../lib/util.js';
 import { VERSION } from '../lib/version.js';
 import { HELP } from '../lib/help.js';
+import { maybeNotifyUpdate } from '../lib/update-check.js';
 import {
   parseArgs, parseConfigArgs, parseHandoffArgs, parseHandoffsArgs, parseHookArgs,
-  parseLiveArgs, parseLogoutArgs, parseManageArgs, parseQArgs,
+  parseLiveArgs, parseLogoutArgs, parseManageArgs, parseQArgs, parseSkillsArgs,
 } from '../lib/parser.js';
 import { actions, approval, attachment, rooms, webhooks } from '../lib/commands/manage.js';
 import { ping } from '../lib/commands/ping.js';
@@ -51,6 +53,7 @@ import { listen } from '../lib/commands/listen.js';
 import { live } from '../lib/commands/live.js';
 import { hook } from '../lib/commands/hook.js';
 import { mcp } from '../lib/commands/mcp.js';
+import { skills } from '../lib/commands/skills.js';
 import { activateStoredInbox, bare } from '../lib/commands/connect.js';
 import { config, logout } from '../lib/commands/config.js';
 
@@ -66,6 +69,7 @@ const COMMANDS = {
   listen: (rest) => listen(parseQArgs(rest)),
   hook: (rest) => hook(parseHookArgs(rest)),
   mcp,
+  skills: (rest) => skills(parseSkillsArgs(rest)),
   activate: (rest) => activateStoredInbox(parseQArgs(rest)),
   live: (rest) => live(parseLiveArgs(rest)),
   rooms: (rest) => rooms(parseManageArgs(rest)),
@@ -100,7 +104,9 @@ async function main() {
   // A leading flag with no subcommand (`pingroom --api …`) counts as bare — it
   // configures the connect attempt rather than naming a command.
   if (!command || command.startsWith('-')) {
-    process.exit(await bare(parseQArgs(argv)));
+    const bareCode = await bare(parseQArgs(argv));
+    await maybeNotifyUpdate(VERSION);
+    process.exit(bareCode);
   }
 
   const handler = COMMANDS[command];
@@ -109,6 +115,9 @@ async function main() {
   }
 
   const code = await handler(argv.slice(1));
+  // After the command's own output, never before, and never in place of it:
+  // the notice is advisory and must not lead. It cannot alter `code`.
+  await maybeNotifyUpdate(VERSION);
   process.exit(code);
 }
 

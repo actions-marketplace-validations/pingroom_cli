@@ -4203,3 +4203,65 @@ test('an unexpected error prints one line, not a stack trace', async () => {
     server.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Management nouns: rooms / webhooks / actions / approval / attachment.
+
+test('management commands appear in the top-level help', () => {
+  const { status, stdout } = run(['--help']);
+  assert.equal(status, 0);
+  for (const noun of ['rooms', 'webhooks', 'actions', 'approval', 'attachment']) {
+    assert.match(stdout, new RegExp(`^  ${noun}`, 'm'));
+  }
+});
+
+test('each management noun prints its own help', () => {
+  for (const [noun, marker] of [
+    ['rooms', /rooms create -n <name>/],
+    ['webhooks', /Prints the secret trigger URL once/],
+    ['actions', /actions set <1-4>/],
+    ['approval', /exit 0 approved/],
+    ['attachment', /attachment get <id>/],
+  ]) {
+    const { status, stdout } = run([noun, '--help']);
+    assert.equal(status, 0, `${noun} --help exits 0`);
+    assert.match(stdout, marker, `${noun} help names its verbs`);
+  }
+});
+
+test('management nouns fail as usage errors without a sub-command or token', () => {
+  // Unknown sub-command → usage, before any credential is consulted.
+  const bad = run(['rooms', 'destroy']);
+  assert.equal(bad.status, 2);
+  assert.match(bad.stderr, /usage: pingroom rooms <list\|get\|create\|join>/);
+
+  // Known sub-command with no credential → the shared agent-token usage error.
+  const noToken = run(['rooms', 'list']);
+  assert.equal(noToken.status, 2);
+  assert.match(noToken.stderr, /an agent token is required/);
+
+  // Room-scoped nouns also demand --room.
+  const noRoom = run(['webhooks', 'list', '--token', 'x'.repeat(40)]);
+  assert.equal(noRoom.status, 2);
+  assert.match(noRoom.stderr, /--room is required/);
+});
+
+test('approval requires a prompt and validates --ttl before the network', () => {
+  const noPrompt = run(['approval', '--token', 'x'.repeat(40), '--room', 'ABC123']);
+  assert.equal(noPrompt.status, 2);
+  assert.match(noPrompt.stderr, /an approval needs --prompt/);
+
+  const badTtl = run(['approval', '-p', 'Deploy?', '--ttl', 'soon', '--token', 'x'.repeat(40), '--room', 'ABC123']);
+  assert.equal(badTtl.status, 2);
+  assert.match(badTtl.stderr, /--ttl must be an integer/);
+});
+
+test('actions set validates the slot and required fields locally', () => {
+  const badSlot = run(['actions', 'set', '9', '--token', 'x'.repeat(40), '--room', 'ABC123']);
+  assert.equal(badSlot.status, 2);
+  assert.match(badSlot.stderr, /actions set <1-4>/);
+
+  const missing = run(['actions', 'set', '2', '--token', 'x'.repeat(40), '--room', 'ABC123']);
+  assert.equal(missing.status, 2);
+  assert.match(missing.stderr, /needs --label and --icon/);
+});

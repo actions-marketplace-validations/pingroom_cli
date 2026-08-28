@@ -41,8 +41,9 @@ import { VERSION } from '../lib/version.js';
 import { HELP } from '../lib/help.js';
 import {
   parseArgs, parseConfigArgs, parseHandoffArgs, parseHandoffsArgs, parseHookArgs,
-  parseLiveArgs, parseLogoutArgs, parseQArgs,
+  parseLiveArgs, parseLogoutArgs, parseManageArgs, parseQArgs,
 } from '../lib/parser.js';
+import { actions, approval, attachment, rooms, webhooks } from '../lib/commands/manage.js';
 import { ping } from '../lib/commands/ping.js';
 import { ask, cancel, list, watch } from '../lib/commands/ask.js';
 import { handoff, listHandoffs } from '../lib/commands/handoff.js';
@@ -67,6 +68,11 @@ const COMMANDS = {
   mcp,
   activate: (rest) => activateStoredInbox(parseQArgs(rest)),
   live: (rest) => live(parseLiveArgs(rest)),
+  rooms: (rest) => rooms(parseManageArgs(rest)),
+  webhooks: (rest) => webhooks(parseManageArgs(rest)),
+  actions: (rest) => actions(parseManageArgs(rest)),
+  approval: (rest) => approval(parseManageArgs(rest)),
+  attachment: (rest) => attachment(parseManageArgs(rest)),
   config: (rest) => config(parseConfigArgs(rest)),
   logout: (rest) => logout(parseLogoutArgs(rest)),
 };

@@ -243,6 +243,36 @@ on the Lock Screen (iOS Live Activity / Dynamic Island, Android live update, and
 a full inline card in the app). `start` opens it with one alert, `update` moves
 it **silently**, `end` closes it with one completion alert.
 
+## Managing rooms, webhooks, and quick actions
+
+The management nouns cover the rest of the agent surface (agent token required;
+`--room` where noted):
+
+```bash
+pingroom rooms list                       # rooms this account belongs to
+pingroom rooms get GZNFB6BZGJIH
+pingroom rooms create -n "Deploys" --icon bell --color "#e33122"
+pingroom rooms create -n "Status" --icon globe --color "#0391fe" --public --handle status
+pingroom rooms join GZNFB6BZGJIH
+
+pingroom webhooks list --room GZNFB6BZGJIH
+pingroom webhooks create --room GZNFB6BZGJIH --name "CI" --action 2   # prints the secret URL once
+pingroom webhooks update <id> --room GZNFB6BZGJIH --enabled false
+pingroom webhooks delete <id> --room GZNFB6BZGJIH
+
+pingroom actions list --room GZNFB6BZGJIH
+pingroom actions set 3 --room GZNFB6BZGJIH --label "Deploy done" --icon 🚀
+pingroom actions trigger 3 --room GZNFB6BZGJIH
+
+pingroom approval -p "Ship v2 to production?" --wait   # exit 0 approved · 4 denied · 3 expired
+
+pingroom attachment get <id> --out report.md
+pingroom attachment delete <id>
+```
+
+Creating webhooks and uploading attachments require a Pro account; public-room
+creation runs under its own consent scope (`pingroom:rooms:publish`).
+
 ## Hearing replies
 
 Everything else here talks; `listen` is how an agent hears — replies to its own

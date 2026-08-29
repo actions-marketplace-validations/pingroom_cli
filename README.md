@@ -85,8 +85,9 @@ and is not retried as if history could be rewritten.
 An incomplete run exits `1`; it never deletes or replaces the saved credential.
 The command does not fall back to `PINGROOM_TOKEN`, an email-only credential, or
 a credential without `pingroom:handoffs:create` and a delivery room. A grant of
-all rooms pins no delivery room — pick one under Connected Agents in the app
-first.
+all rooms pins no delivery room up front — pick one under Connected Agents in
+the app, or run `pingroom rooms create`, which adopts the new room as the
+delivery room when the agent was granted every room.
 
 There is deliberately no `login` command: being unconnected is a state the tool
 resolves, not one you have to discover. Once connected, bare `pingroom` prints

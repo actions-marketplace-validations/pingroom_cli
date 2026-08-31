@@ -97,18 +97,26 @@ that status line followed by the usual help.
 
 Approving on the phone grants two separate things, and both are enforced:
 
-- **Permissions** — the scopes this CLI asks for: `rooms:read`,
-  `broadcast:send`, `attachments:write`, `notifications:read`, `questions:ask`,
-  `handoffs:create`, `live:write`. Nothing widens them later; a command needing
-  one you did not approve returns `403 insufficient_scope`.
+- **Permissions** — one approval covers every command this CLI ships, so it
+  asks for all 16 scopes its commands can need (`lib/scopes.js` is the list):
+  send pings, upload attachments, read pings, ask questions, request approvals,
+  create handoffs, drive live status; read/create/publish/join rooms and
+  set/trigger quick actions; and read/create/delete incoming webhooks. It does
+  **not** ask for `profile:write` (no command uses it) or the retired
+  `agents:ping`. Nothing widens them later — consent is an intersection, so a
+  scope the pairing did not request can never be granted afterwards; a command
+  needing one you did not approve returns `403 insufficient_scope`.
 - **Rooms** — one room, several, or all of them. A room outside that grant
   returns `403 room_not_granted` on every room-scoped call — writes such as
   pings, questions and live streams, and reads such as listing a room's quick
   actions or webhooks. Widen it under Connected Agents in the app.
 
 Both refusals print the fix, not just the code. A credential paired by an older
-CLI carries the scope set that version asked for — reconnect to re-approve if a
-command starts reporting `insufficient_scope`.
+CLI carries the scope set that version asked for — CLIs before 0.8.1 asked for
+only seven — so run `pingroom reconnect` if a command starts reporting
+`insufficient_scope`. That re-approves with the current set, keeps the existing
+connection working until you approve the new one, and revokes the old one only
+afterwards, so cancelling changes nothing.
 
 The credential lands in `~/.pingroom/credentials.json` (mode `0600`, inside a
 `0700` directory). `PINGROOM_HOME` moves that directory; `pingroom logout`

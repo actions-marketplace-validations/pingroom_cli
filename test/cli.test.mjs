@@ -4267,9 +4267,13 @@ test('every dispatched command declares the scopes it needs', async () => {
   // Read the dispatch table out of the binary itself rather than restating it,
   // so adding a command to COMMANDS and forgetting this map is a failure here.
   const table = source.slice(source.indexOf('const COMMANDS = {'), source.indexOf('\n};', source.indexOf('const COMMANDS = {')));
-  const dispatched = [...table.matchAll(/^\s{2}([a-z]+):/gm)].map((m) => m[1]);
+  // `[:,]` not `:` — an ES6 shorthand entry (`  mcp,`) is still a dispatched
+  // command, and a colon-only pattern gave it, and any future shorthand entry,
+  // a free pass through the guard below.
+  const dispatched = [...table.matchAll(/^\s{2}([a-z]+)[:,]/gm)].map((m) => m[1]);
 
-  assert.ok(dispatched.length > 15, `expected the full dispatch table, saw ${dispatched.length}`);
+  assert.ok(dispatched.length >= 22, `expected the full dispatch table, saw ${dispatched.length}`);
+  assert.ok(dispatched.includes('mcp'), 'shorthand entries must be captured');
   for (const command of dispatched) {
     assert.ok(
       Object.prototype.hasOwnProperty.call(COMMAND_SCOPES, command),
@@ -4788,6 +4792,42 @@ test('reconnect requests all 16 scopes at pair/start', async () => {
     const { CLI_SCOPES } = await import('../lib/scopes.js');
     const start = received.find((r) => r.path === '/api/agent/auth/pair/start');
     assert.deepEqual(JSON.parse(start.body).scopes, CLI_SCOPES);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconnect refuses to send the stored credential to another origin', async () => {
+  // The revoke leg carries the OLD, still-valid bearer. Without the origin
+  // binding every other stored-bearer command obeys, `--api` (or a stale
+  // config.json api_url) redirects a live production credential to any host
+  // that happens to satisfy the https/loopback check.
+  const home = newHome();
+  const { server, baseUrl, received } = await reconnectServer();
+  try {
+    // Paired against a DIFFERENT origin than the one we are about to name.
+    seedCredential(home, { token: 'live_prod_tok', handle: 'agt_old', api_url: 'https://api.pingroom.io' });
+
+    const { status, stderr } = await runAsync(
+      ['reconnect', '--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
+      { stdin: '', timeoutMs: 20000 },
+    );
+
+    assert.equal(status, 2, 'a cross-origin reconnect is a usage error');
+    assert.match(stderr, /stored credential is bound to https:\/\/api\.pingroom\.io/);
+    assert.ok(
+      !received.some((r) => r.auth === 'Bearer live_prod_tok'),
+      'the live credential must never reach the other host',
+    );
+    // And it must refuse BEFORE minting anything against the wrong host.
+    assert.equal(received.length, 0, 'nothing may be sent at all');
+    assert.equal(
+      JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8')).token,
+      'live_prod_tok',
+      'the stored credential is untouched',
+    );
   } finally {
     server.close();
     rmSync(home, { recursive: true, force: true });

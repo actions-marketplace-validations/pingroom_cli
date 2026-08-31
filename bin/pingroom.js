@@ -43,7 +43,8 @@ import { HELP } from '../lib/help.js';
 import { maybeNotifyUpdate } from '../lib/update-check.js';
 import {
   parseArgs, parseConfigArgs, parseHandoffArgs, parseHandoffsArgs, parseHookArgs,
-  parseLiveArgs, parseLogoutArgs, parseManageArgs, parseQArgs, parseSkillsArgs,
+  parseLiveArgs, parseLogoutArgs, parseManageArgs, parseQArgs, parseReconnectArgs,
+  parseSkillsArgs,
 } from '../lib/parser.js';
 import { actions, approval, attachment, rooms, webhooks } from '../lib/commands/manage.js';
 import { ping } from '../lib/commands/ping.js';
@@ -54,7 +55,7 @@ import { live } from '../lib/commands/live.js';
 import { hook } from '../lib/commands/hook.js';
 import { mcp } from '../lib/commands/mcp.js';
 import { skills } from '../lib/commands/skills.js';
-import { activateStoredInbox, bare } from '../lib/commands/connect.js';
+import { activateStoredInbox, bare, reconnect } from '../lib/commands/connect.js';
 import { config, logout } from '../lib/commands/config.js';
 
 const COMMANDS = {
@@ -78,6 +79,7 @@ const COMMANDS = {
   approval: (rest) => approval(parseManageArgs(rest)),
   attachment: (rest) => attachment(parseManageArgs(rest)),
   config: (rest) => config(parseConfigArgs(rest)),
+  reconnect: (rest) => reconnect(parseReconnectArgs(rest)),
   logout: (rest) => logout(parseLogoutArgs(rest)),
 };
 

@@ -968,7 +968,7 @@ function questionServer(routes) {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const path = req.url.split('?')[0];
-      received.push({ method: req.method, path, query: req.url.split('?')[1] ?? '', auth: req.headers['authorization'], body });
+      received.push({ method: req.method, path, query: req.url.split('?')[1] ?? '', auth: req.headers['authorization'], idempotency: req.headers['idempotency-key'], body });
       const handler = routes[`${req.method} ${path}`];
       const out = handler ? handler(body) : { status: 404, body: { message: 'no route' } };
       res.writeHead(out.status ?? 200, { 'Content-Type': 'application/json' });
@@ -1732,7 +1732,9 @@ test('hook Stop pings the room with the last assistant message', async () => {
     assert.equal(body.title, 'Claude finished');
     assert.equal(body.message, 'Refactored auth module, 3 files changed.');
     assert.equal(body.correlation_id, 's-1');
-    assert.deepEqual(body.data, { event: 'Stop', session_id: 's-1', cwd: '/work' });
+    // `data` fans out to every room member's push and to the room's outgoing
+    // webhook, so the local working directory must not be in it.
+    assert.deepEqual(body.data, { event: 'Stop', session_id: 's-1' });
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1834,7 +1836,7 @@ test('hook PreToolUse asks a question and returns allow when approved', async ()
       { value: 'deny', label: 'Deny', style: 'danger' },
     ]);
     assert.equal(body.correlation_id, 's-2');
-    assert.deepEqual(body.data, { tool_name: 'Bash', cwd: '/work' });
+    assert.deepEqual(body.data, { tool_name: 'Bash' }, 'cwd is a local path and must never reach the room');
   } finally {
     server.close();
   }
@@ -4027,7 +4029,7 @@ test('a refusal the operator can fix carries the fix, not just the code', async 
     {
       status: 403,
       body: { code: 'insufficient_scope', message: 'This credential lacks the required scope.' },
-      expect: /reconnect and re-approve/,
+      expect: /Run "pingroom reconnect" to re-approve/,
     },
   ];
 
@@ -4224,7 +4226,7 @@ test('each management noun prints its own help', () => {
     ['rooms', /rooms create -n <name>/],
     ['webhooks', /Prints the secret trigger URL once/],
     ['actions', /actions set <1-4>/],
-    ['approval', /exit 0 approved/],
+    ['approval', /exit 0 approve · 4 deny/],
     ['attachment', /attachment get <id>/],
   ]) {
     const { status, stdout } = run([noun, '--help']);
@@ -4250,6 +4252,77 @@ test('management nouns fail as usage errors without a sub-command or token', () 
   assert.match(noRoom.stderr, /--room is required/);
 });
 
+// --- the command-to-scope contract ----------------------------------------
+//
+// The promise is "one pairing approval enables every command PingRoom ships".
+// Nothing enforced that, which is how `approval`, all of `webhooks`, `rooms
+// create|join` and `actions set|trigger` shipped 403ing on a fresh pairing:
+// consent is an intersection server-side, so a scope the pairing never asked
+// for can never be granted. These two assertions are the enforcement.
+
+test('every dispatched command declares the scopes it needs', async () => {
+  const { COMMAND_SCOPES } = await import('../lib/scopes.js');
+  const source = readFileSync(new URL('../bin/pingroom.js', import.meta.url), 'utf8');
+
+  // Read the dispatch table out of the binary itself rather than restating it,
+  // so adding a command to COMMANDS and forgetting this map is a failure here.
+  const table = source.slice(source.indexOf('const COMMANDS = {'), source.indexOf('\n};', source.indexOf('const COMMANDS = {')));
+  const dispatched = [...table.matchAll(/^\s{2}([a-z]+):/gm)].map((m) => m[1]);
+
+  assert.ok(dispatched.length > 15, `expected the full dispatch table, saw ${dispatched.length}`);
+  for (const command of dispatched) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(COMMAND_SCOPES, command),
+      `"${command}" is dispatched but declares no scopes in lib/scopes.js — add it (use [] if it touches no agent route)`,
+    );
+  }
+});
+
+test('every scope a command needs is requested at pairing', async () => {
+  const { CLI_SCOPES, COMMAND_SCOPES } = await import('../lib/scopes.js');
+
+  for (const [command, needed] of Object.entries(COMMAND_SCOPES)) {
+    for (const scope of needed) {
+      assert.ok(
+        CLI_SCOPES.includes(scope),
+        `"${command}" needs ${scope}, which pairing never requests — it would 403 on a fresh connection`,
+      );
+    }
+  }
+
+  // And nothing is requested that no command can use: the consent screen must
+  // not ask for a permission we cannot justify to the human reading it. The one
+  // deliberate exception is approvals:request, kept so the legacy approvals
+  // surface (SDK/MCP) stays usable without a second re-pairing.
+  const used = new Set(Object.values(COMMAND_SCOPES).flat());
+  const unused = CLI_SCOPES.filter((s) => !used.has(s) && s !== 'pingroom:approvals:request');
+  assert.deepEqual(unused, [], `requested but unused scopes: ${unused.join(', ')}`);
+});
+
+test('pairing requests the 16 scopes and never the retired or unused ones', async () => {
+  const { CLI_SCOPES } = await import('../lib/scopes.js');
+  assert.equal(CLI_SCOPES.length, 16);
+  assert.equal(new Set(CLI_SCOPES).size, 16, 'no duplicates');
+  // agents:ping is retired (the route answers 410) and its consent label
+  // literally reads "(retired)"; profile:write has no CLI command.
+  assert.ok(!CLI_SCOPES.includes('pingroom:agents:ping'));
+  assert.ok(!CLI_SCOPES.includes('pingroom:profile:write'));
+});
+
+test('reconnect refuses an env token rather than revoking someone else\'s credential', async () => {
+  const { status, stderr } = await runAsync(['reconnect'], { PINGROOM_TOKEN: 'x'.repeat(40) });
+  assert.equal(status, 2);
+  assert.match(stderr, /PINGROOM_TOKEN is set/);
+  assert.match(stderr, /revoke whatever credential it names/);
+});
+
+test('reconnect without a stored credential points at pairing, not at itself', async () => {
+  const { status, stderr } = await runAsync(['reconnect']);
+  assert.equal(status, 2);
+  assert.match(stderr, /not connected/);
+  assert.match(stderr, /Run "pingroom" to pair/);
+});
+
 test('approval requires a prompt and validates --ttl before the network', () => {
   const noPrompt = run(['approval', '--token', 'x'.repeat(40), '--room', 'ABC123']);
   assert.equal(noPrompt.status, 2);
@@ -4258,6 +4331,161 @@ test('approval requires a prompt and validates --ttl before the network', () => 
   const badTtl = run(['approval', '-p', 'Deploy?', '--ttl', 'soon', '--token', 'x'.repeat(40), '--room', 'ABC123']);
   assert.equal(badTtl.status, 2);
   assert.match(badTtl.stderr, /--ttl must be an integer/);
+});
+
+// --- approval: the deploy gate -------------------------------------------
+//
+// This command had zero tests that reached the network, which is how it shipped
+// sending the wrong payload, reading a field the server never sends, and
+// exiting 0 on a denial. Every assertion below pins one of those three.
+
+test('approval creates a two-option Question, not a legacy approval', async () => {
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_ap', state: 'pending' } }),
+  });
+  try {
+    const { status, stdout, stderr } = await runAsync([
+      'approval', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      '-p', 'Ship v2 to production?', '-c', 'build 412',
+    ]);
+    assert.equal(status, 0, stderr);
+    assert.equal(stdout.trim(), 'q_ap');
+
+    const create = received.find((r) => r.method === 'POST');
+    assert.equal(create.path, '/api/agent/rooms/ab12cd/questions');
+    const body = JSON.parse(create.body);
+    // `prompt`/`context` is the Question vocabulary. The old code sent these to
+    // /approvals, which wants `question`/`title`, and 422'd every time.
+    assert.equal(body.prompt, 'Ship v2 to production?');
+    assert.equal(body.context, 'build 412');
+    assert.deepEqual(body.options, [
+      { value: 'approve', label: 'Approve', style: 'primary' },
+      { value: 'deny', label: 'Deny', style: 'danger' },
+    ]);
+  } finally {
+    server.close();
+  }
+});
+
+test('approval --wait exits 0 and prints the decision on approve', async () => {
+  const { server, baseUrl } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_ok', state: 'pending' } }),
+    'GET /api/agent/questions/q_ok/wait': () => ({
+      status: 200,
+      body: { id: 'q_ok', state: 'answered', answer: { value: 'approve', label: 'Approve' } },
+    }),
+  });
+  try {
+    const { status, stdout, stderr, timedOut } = await runAsync(
+      ['approval', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl, '--wait', '-p', 'Ship?'],
+      {},
+      { timeoutMs: 15000 },
+    );
+    assert.equal(timedOut, false, 'the wait loop must terminate once answered');
+    assert.equal(status, 0, stderr);
+    assert.equal(stdout.trim(), 'approve');
+  } finally {
+    server.close();
+  }
+});
+
+test('approval --wait exits 4 on deny — a gate must never fail open', async () => {
+  const { server, baseUrl } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_no', state: 'pending' } }),
+    'GET /api/agent/questions/q_no/wait': () => ({
+      status: 200,
+      body: { id: 'q_no', state: 'answered', answer: { value: 'deny', label: 'Deny' } },
+    }),
+  });
+  try {
+    const { status, stdout, timedOut } = await runAsync(
+      ['approval', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl, '--wait', '-p', 'Ship?'],
+      {},
+      { timeoutMs: 15000 },
+    );
+    assert.equal(timedOut, false);
+    // The whole point: `answered` alone is not success. Only `approve` is.
+    assert.equal(status, 4);
+    assert.equal(stdout.trim(), 'deny');
+  } finally {
+    server.close();
+  }
+});
+
+test('approval --wait exits 3 on expiry and 4 on cancellation', async () => {
+  for (const [state, code] of [['expired', 3], ['cancelled', 4]]) {
+    const { server, baseUrl } = await questionServer({
+      'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_x', state: 'pending' } }),
+      'GET /api/agent/questions/q_x/wait': () => ({ status: 200, body: { id: 'q_x', state, answer: null } }),
+    });
+    try {
+      const { status, stdout, stderr, timedOut } = await runAsync(
+        ['approval', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl, '--wait', '-p', 'Ship?'],
+        {},
+        { timeoutMs: 15000 },
+      );
+      assert.equal(timedOut, false, `${state} must terminate the wait loop`);
+      assert.equal(status, code, `${state} exits ${code}`);
+      assert.equal(stdout, '', 'a non-answer leaves stdout empty for $(...)');
+      assert.match(stderr, new RegExp(`approval ${state}`));
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test('approval --wait re-polls a pending hold without hot-looping', async () => {
+  let waits = 0;
+  const { server, baseUrl } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_p', state: 'pending' } }),
+    'GET /api/agent/questions/q_p/wait': () => {
+      waits += 1;
+      // A server that answers `pending` instantly, ignoring the hold. Without
+      // the 1s floor this spins at full speed.
+      return waits < 3
+        ? { status: 200, body: { id: 'q_p', state: 'pending' } }
+        : { status: 200, body: { id: 'q_p', state: 'answered', answer: { value: 'approve' } } };
+    },
+  });
+  try {
+    const started = Date.now();
+    const { status, timedOut } = await runAsync(
+      ['approval', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl, '--wait', '-p', 'Ship?'],
+      {},
+      { timeoutMs: 20000 },
+    );
+    assert.equal(timedOut, false);
+    assert.equal(status, 0);
+    assert.equal(waits, 3);
+    assert.ok(Date.now() - started >= 2000, 'two pending rounds must cost at least the 1s floor each');
+  } finally {
+    server.close();
+  }
+});
+
+test('approval sends Idempotency-Key as a header, never in the body', async () => {
+  const { server, baseUrl, received } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_i', state: 'pending' } }),
+  });
+  try {
+    const { status } = await runAsync([
+      'approval', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl,
+      '-p', 'Ship?', '--idempotency-key', 'deploy-412',
+    ]);
+    assert.equal(status, 0);
+    const create = received.find((r) => r.method === 'POST');
+    assert.equal(create.idempotency, 'deploy-412');
+    assert.equal(JSON.parse(create.body).idempotency_key, undefined);
+  } finally {
+    server.close();
+  }
+
+  const unsafe = run([
+    'approval', '-p', 'Ship?', '--idempotency-key', 'has space',
+    '--token', 'x'.repeat(40), '--room', 'ABC123',
+  ]);
+  assert.equal(unsafe.status, 2);
+  assert.match(unsafe.stderr, /--idempotency-key must be/);
 });
 
 test('actions set validates the slot and required fields locally', () => {
@@ -4355,4 +4583,71 @@ test('the update check stays silent and writes nothing when stdout is not a TTY'
   assert.equal(stderr, '');
   assert.equal(existsSync(join(home, 'update-check.json')), false);
   rmSync(home, { recursive: true, force: true });
+});
+
+// --- the continuation record ------------------------------------------------
+//
+// The resume hint the hook writes stays on this machine. These pin both halves:
+// it IS recorded locally, and it is NOT on the wire (asserted above, in the two
+// hook `data` assertions).
+
+test('the hook records a local continuation and forgets it once answered', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-cont-'));
+  const { server, baseUrl } = await questionServer({
+    'POST /api/agent/rooms/ab12cd/questions': () => ({ status: 201, body: { id: 'q_cont', state: 'pending' } }),
+    'GET /api/agent/questions/q_cont/wait': () => ({
+      status: 200,
+      body: { id: 'q_cont', state: 'answered', answer: { value: 'allow' } },
+    }),
+  });
+  try {
+    const event = JSON.stringify({
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf build' },
+      session_id: 's-cont',
+      cwd: '/work/repo',
+      transcript_path: '/work/t.jsonl',
+    });
+    const { status } = await runAsync(
+      ['hook', '--token', 'tok', '--room', 'ab12cd', '--api', baseUrl],
+      { PINGROOM_HOME: dir },
+      { stdin: event },
+    );
+    assert.equal(status, 0);
+
+    // Answered, so the hint has done its job and is pruned.
+    const after = JSON.parse(readFileSync(join(dir, 'continuations.json'), 'utf8'));
+    assert.deepEqual(after.entries, {}, 'a resolved question leaves no continuation behind');
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a continuation survives while its question is still open', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pingroom-cont2-'));
+  const { recordContinuation, readContinuation, forgetContinuation } =
+    await import('../lib/continuations.js');
+  const prev = process.env.PINGROOM_HOME;
+  process.env.PINGROOM_HOME = dir;
+  try {
+    recordContinuation('q_1', { sessionId: 's-9', cwd: '/repo', transcriptPath: '/t.jsonl' });
+    const row = readContinuation('q_1');
+    assert.equal(row.session_id, 's-9');
+    assert.equal(row.cwd, '/repo');
+    assert.equal(row.transcript_path, '/t.jsonl');
+    assert.ok(Date.parse(row.recorded_at) > 0);
+
+    // Bounded: the file cannot grow without limit.
+    for (let i = 0; i < 120; i += 1) recordContinuation(`q_bulk_${i}`, { sessionId: 's' });
+    const entries = JSON.parse(readFileSync(join(dir, 'continuations.json'), 'utf8')).entries;
+    assert.ok(Object.keys(entries).length <= 100, 'store is capped at 100 entries');
+
+    forgetContinuation('q_bulk_119');
+    assert.equal(readContinuation('q_bulk_119'), null);
+  } finally {
+    if (prev === undefined) delete process.env.PINGROOM_HOME; else process.env.PINGROOM_HOME = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

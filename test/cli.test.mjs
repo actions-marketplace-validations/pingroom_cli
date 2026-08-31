@@ -4651,3 +4651,145 @@ test('a continuation survives while its question is still open', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --- reconnect, end to end --------------------------------------------------
+//
+// The command replaces a live credential and then revokes the old one, so the
+// ORDER is the whole design: nothing may be written or revoked until the human
+// has approved, and the revoke must carry the OLD bearer, after the new
+// credential is already durable on disk.
+
+/** Pairing endpoints plus a revoke route, so reconnect can be driven end to end. */
+function reconnectServer({ revokeStatus = 204, statuses = [ACTIVE_PAIR] } = {}) {
+  const received = [];
+  let poll = 0;
+  return startServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const path = req.url.split('?')[0];
+      received.push({ method: req.method, path, auth: req.headers['authorization'], body });
+      let out;
+      if (path === '/api/agent/auth') {
+        out = { status: 200, body: { credential: 'pre_claim_jwt', credential_type: 'pre_claim', expires_in: 900, scopes: [] } };
+      } else if (path === '/api/agent/auth/pair/start') {
+        out = {
+          status: 200,
+          body: {
+            pair_token: 'p'.repeat(64),
+            pair_url: `https://pingroom.io/app/agents/pair?token=${'p'.repeat(64)}`,
+            expires_in: 900,
+            poll_interval_ms: 10,
+          },
+        };
+      } else if (path === '/api/agent/auth/pair/status') {
+        out = { status: 200, body: statuses[Math.min(poll++, statuses.length - 1)] };
+      } else if (path === '/api/agent/auth/revoke') {
+        // 204 No Content is the real shape; the CLI must not read it as failure.
+        out = { status: revokeStatus, body: revokeStatus === 204 ? null : { message: 'nope' } };
+      } else {
+        out = { status: 404, body: { message: 'no route' } };
+      }
+      res.writeHead(out.status, { 'Content-Type': 'application/json' });
+      res.end(out.body === null ? '' : JSON.stringify(out.body));
+    });
+  }).then((s) => ({ ...s, received }));
+}
+
+test('reconnect saves the new credential BEFORE revoking the old one', async () => {
+  const home = newHome();
+  seedCredential(home, { token: 'old_tok', handle: 'agt_old', api_url: 'PLACEHOLDER' });
+  const { server, baseUrl, received } = await reconnectServer();
+  // The stored credential is origin-bound, so it has to name this stub.
+  seedCredential(home, { token: 'old_tok', handle: 'agt_old', api_url: baseUrl });
+  try {
+    const { status, stdout, stderr } = await runAsync(
+      ['reconnect', '--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
+      { stdin: '', timeoutMs: 20000 },
+    );
+    assert.equal(status, 0, stderr);
+
+    // The replacement is on disk...
+    const saved = JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8'));
+    assert.equal(saved.token, 'active_jwt');
+
+    // ...and the revoke went out with the OLD bearer, after the pairing completed.
+    const revoke = received.find((r) => r.path === '/api/agent/auth/revoke');
+    assert.ok(revoke, 'the old credential must be revoked');
+    assert.equal(revoke.auth, 'Bearer old_tok');
+    const order = received.map((r) => r.path);
+    assert.ok(
+      order.indexOf('/api/agent/auth/pair/status') < order.indexOf('/api/agent/auth/revoke'),
+      'revoke must come after the human approved',
+    );
+    assert.match(stdout, /Previous connection revoked/);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconnect keeps the new credential when the revoke fails', async () => {
+  const home = newHome();
+  const { server, baseUrl } = await reconnectServer({ revokeStatus: 500 });
+  seedCredential(home, { token: 'old_tok', handle: 'agt_old', api_url: baseUrl });
+  try {
+    const { status, stdout } = await runAsync(
+      ['reconnect', '--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
+      { stdin: '', timeoutMs: 20000 },
+    );
+    // A failed revoke is untidy, not dangerous: the new credential is already
+    // durable, so exiting non-zero would imply the reconnect did not happen.
+    assert.equal(status, 0);
+    assert.equal(JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8')).token, 'active_jwt');
+    assert.match(stdout, /could not be revoked/);
+    assert.match(stdout, /Connected Agents/);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconnect leaves the old credential untouched when pairing lapses', async () => {
+  const home = newHome();
+  const { server, baseUrl, received } = await reconnectServer({ statuses: [{ status: 'expired' }] });
+  seedCredential(home, { token: 'old_tok', handle: 'agt_old', api_url: baseUrl });
+  try {
+    const { status } = await runAsync(
+      ['reconnect', '--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
+      { stdin: 'n\n', timeoutMs: 20000 },
+    );
+    assert.equal(status, 3, 'a lapsed pairing is EXIT.EXPIRED');
+    // The whole promise of the command: declining changes nothing.
+    assert.equal(JSON.parse(readFileSync(join(home, 'credentials.json'), 'utf8')).token, 'old_tok');
+    assert.ok(
+      !received.some((r) => r.path === '/api/agent/auth/revoke'),
+      'nothing may be revoked when the human never approved',
+    );
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconnect requests all 16 scopes at pair/start', async () => {
+  const home = newHome();
+  const { server, baseUrl, received } = await reconnectServer();
+  seedCredential(home, { token: 'old_tok', handle: 'agt_old', api_url: baseUrl });
+  try {
+    await runAsync(
+      ['reconnect', '--api', baseUrl],
+      { PINGROOM_HOME: home, PINGROOM_INTERNAL_TEST_TTY: '1', NODE_ENV: 'test', COLUMNS: '120' },
+      { stdin: '', timeoutMs: 20000 },
+    );
+    const { CLI_SCOPES } = await import('../lib/scopes.js');
+    const start = received.find((r) => r.path === '/api/agent/auth/pair/start');
+    assert.deepEqual(JSON.parse(start.body).scopes, CLI_SCOPES);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
